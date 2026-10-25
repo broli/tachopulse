@@ -481,6 +481,8 @@ class KdeStyleSensorEngine:
 
         total = info.get("MemTotal", 0)
         avail = info.get("MemAvailable", info.get("MemFree", 0))
+        self._mem_total_bytes = total
+        self._shmem_bytes = info.get("Shmem", 0)
         if total > 0:
             used = max(0, total - avail)
             pct = used / total * 100.0
@@ -601,9 +603,23 @@ class KdeStyleSensorEngine:
                 default_color="blue" if idx == 0 else "cyan",
             )
 
-            # VRAM
+            # VRAM (or Shared iGPU Graphics Memory via DRM fdinfo / GEM Shmem)
             mem_used = g.get("mem_used")
             mem_total = g.get("mem_total")
+            if mem_used is None or mem_total is None:
+                proc_sum = 0.0
+                for p in g.get("processes", []) or []:
+                    if isinstance(p, dict) and p.get("gpu_mem_bytes_alloc") is not None:
+                        try:
+                            proc_sum += float(p["gpu_mem_bytes_alloc"])
+                        except (ValueError, TypeError):
+                            pass
+                if proc_sum <= 0:
+                    proc_sum = float(getattr(self, "_shmem_bytes", 0))
+                sys_ram = float(getattr(self, "_mem_total_bytes", 16 * 1024 ** 3))
+                mem_used = proc_sum
+                mem_total = max(4.0 * 1024 ** 3, sys_ram * 0.5)
+
             if mem_used is not None and mem_total is not None:
                 try:
                     u_b = float(mem_used)
@@ -692,6 +708,23 @@ class KdeStyleSensorEngine:
                         sub_text=f"{cur_mhz:.0f}MHz",
                         percent=pct,
                         icon="device-desktop",
+                        default_color="cyan",
+                    )
+                    u_b = float(getattr(self, "_shmem_bytes", 0))
+                    t_b = max(4.0 * 1024 ** 3, float(getattr(self, "_mem_total_bytes", 16 * 1024 ** 3)) * 0.5)
+                    f_b = max(0.0, t_b - u_b)
+                    igpu_mem_pct = u_b / t_b * 100.0
+                    self.register(
+                        sensor_id=f"gpu/gpu{idx}/usedVramPct",
+                        category=f"GPU {idx}: Intel Integrated Graphics ({card_name})",
+                        name="Intel iGPU Shared Memory (GEM/Shmem)",
+                        short_label="iGPUM",
+                        value=igpu_mem_pct,
+                        unit="%",
+                        val_text=format_bytes(u_b),
+                        sub_text=f"+{format_bytes(f_b)}",
+                        percent=igpu_mem_pct,
+                        icon="cpu-2",
                         default_color="cyan",
                     )
                 self.register(
