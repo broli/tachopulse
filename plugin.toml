@@ -1,0 +1,80 @@
+# TachoPulse - Hardware-Agnostic Telemetry Widget & Desktop Monitor for Noctalia v5
+#
+# Sensor identification and classification logic adapted from KDE Plasma's
+# `ksystemstats` and `libksysguard` plugins (GPL-2.0-or-later), paired with
+# 3x supersampled Ring, Bar, and Histogram graph rendering inspired by `tordex/nvtop`.
+
+id = "broli/tachopulse"
+name = "TachoPulse"
+version = "1.0.0"
+plugin_api = 32
+author = "broli"
+license = "GPL-2.0-or-later"
+dependencies = ["python3"]
+tags = ["system", "hardware", "monitor", "gpu", "cpu", "sensors", "desktop"]
+icon = "gauge"
+description = "Dynamic KDE-style hardware sensor monitor with glowing Ring, Bar, and Histogram graphs for both Status Bar and Desktop."
+
+[[setting]]
+key = "poll_interval_ms"
+type = "int"
+label_key = "settings.poll_interval_ms.label"
+description_key = "settings.poll_interval_ms.description"
+default = 2000
+min = 500
+max = 10000
+
+[[setting]]
+key = "bar_gauge_size"
+type = "int"
+label_key = "settings.bar_gauge_size.label"
+description_key = "settings.bar_gauge_size.description"
+default = 34
+min = 22
+max = 96
+
+[[setting]]
+key = "desktop_gauge_size"
+type = "int"
+label_key = "settings.desktop_gauge_size.label"
+description_key = "settings.desktop_gauge_size.description"
+default = 96
+min = 56
+max = 160
+
+[[setting]]
+key = "desktop_columns"
+type = "int"
+label_key = "settings.desktop_columns.label"
+description_key = "settings.desktop_columns.description"
+default = 3
+min = 1
+max = 8
+
+[[setting]]
+key = "respect_gpu_sleep"
+type = "bool"
+label_key = "settings.respect_gpu_sleep.label"
+description_key = "settings.respect_gpu_sleep.description"
+default = false
+
+[[service]]
+id = "daemon"
+entry = "service.luau"
+
+[[widget]]
+id = "bar"
+entry = "bar.luau"
+
+[[desktop_widget]]
+id = "desktop"
+entry = "desktop.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 680
+height = 560
+placement = "attached"
+position = "auto"
+open_near_click = true

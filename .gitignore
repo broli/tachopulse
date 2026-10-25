@@ -1,0 +1,14 @@
+# Python bytecode & virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Runtime & scratch artifacts
+*.tmp
+*.bak
+.DS_Store
+
+# Local testing output
+/tmp_out/

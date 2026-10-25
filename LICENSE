@@ -1,0 +1,28 @@
+GNU GENERAL PUBLIC LICENSE
+Version 2, June 1991 (or at your option, any later version: GPL-2.0-or-later)
+
+Copyright (c) 2026 Carlos (broli)
+
+Sensor Identification & Classification Attribution:
+The dynamic hardware sensor discovery and classification engine in
+`scripts/sensor_daemon.py` adapts the Linux sensor identification hierarchy
+and `/sys` / `/proc` / `hwmon` / `drm` classification algorithms from the
+KDE Plasma `ksystemstats` and `libksysguard` projects:
+- https://invent.kde.org/plasma/ksystemstats
+- https://invent.kde.org/plasma/libksysguard
+Copyright (c) KDE Project Contributors, licensed under GPL-2.0-or-later /
+LGPL-2.1-or-later.
+
+Circular Gauge Rendering Attribution:
+Supersampled capsule-arc tachometer rendering inspired by `tordex/nvtop`
+(MIT License) and KDE Plasma Sensor Faces (`org.kde.ksysguard.piechart`).
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.

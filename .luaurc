@@ -1,0 +1,14 @@
+{
+  "languageMode": "nonstrict",
+  "lint": {
+    "*": true,
+    "GlobalUsedAsLocal": false
+  },
+  "globals": [
+    "noctalia",
+    "ui",
+    "barWidget",
+    "desktopWidget",
+    "panel"
+  ]
+}

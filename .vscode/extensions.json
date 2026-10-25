@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "JohnnyMorganz.luau-lsp",
+    "JohnnyMorganz.stylua",
+    "tamasfe.even-better-toml",
+    "ms-python.python"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "files.associations": {
+    "*.luau": "luau"
+  },
+  "luau-lsp.types.definitionFiles": [
+    "noctalia.d.luau"
+  ],
+  "luau-lsp.completion.imports.enabled": true,
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "[python]": {
+    "editor.tabSize": 4
+  }
+}

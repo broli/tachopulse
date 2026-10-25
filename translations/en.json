@@ -1,0 +1,45 @@
+{
+  "settings": {
+    "poll_interval_ms": {
+      "label": "Refresh Interval (ms)",
+      "description": "How often TachoPulse polls hardware sensors and redraws graphs (500–10000 ms)."
+    },
+    "bar_gauge_size": {
+      "label": "Bar Graph Size (px)",
+      "description": "Pixel size for status bar graphs. Sizes < 52px use a high-contrast compact ring; sizes >= 52px render a full 3-line inner tachometer."
+    },
+    "desktop_gauge_size": {
+      "label": "Desktop Graph Size (px)",
+      "description": "Pixel size for full-sized desktop widget tachometers, bars, and histograms (56–160 px)."
+    },
+    "desktop_columns": {
+      "label": "Desktop Grid Columns",
+      "description": "Number of sensor cards per row in the Desktop Widget."
+    },
+    "respect_gpu_sleep": {
+      "label": "Respect Discrete GPU Sleep",
+      "description": "Avoid waking suspended discrete GPUs when polling."
+    }
+  },
+  "ui": {
+    "title": "TachoPulse Sensor Studio",
+    "subtitle": "KDE-style dynamic /sys, /proc & multi-GPU telemetry",
+    "tab_active": "Active Sensors",
+    "tab_browser": "+ Add Sensor",
+    "reset_defaults": "Reset Defaults",
+    "search_placeholder": "Filter sensors by name, chip, GPU, fan, disk, or net...",
+    "all_categories": "All",
+    "no_active": "No active sensors configured. Click '+ Add Sensor' or 'Reset Defaults'.",
+    "no_matches": "No hardware sensors match the current filter.",
+    "graph_ring": "Ring",
+    "graph_bar": "Bar",
+    "graph_histogram": "Hist",
+    "toggle_icon": "Icon",
+    "toggle_label": "Label",
+    "toggle_value": "Value",
+    "toggle_graph": "Graph",
+    "toggle_bar": "Top Bar",
+    "toggle_desktop": "Desktop",
+    "add_btn": "+ Add"
+  }
+}
