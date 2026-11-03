@@ -1,8 +1,5 @@
-# TachoPulse - Hardware-Agnostic Telemetry Widget & Desktop Monitor for Noctalia v5
-#
-# Sensor identification and classification logic adapted from KDE Plasma's
-# `ksystemstats` and `libksysguard` plugins (GPL-2.0-or-later), paired with
-# 3x supersampled Ring, Bar, and Histogram graph rendering inspired by `tordex/nvtop`.
+# TachoPulse - Hardware Telemetry Widget for Noctalia v5
+# Discovers hardware and storage sensors with configurable gauge visuals.
 
 id = "broli/tachopulse"
 name = "TachoPulse"
@@ -11,9 +8,9 @@ plugin_api = 32
 author = "broli"
 license = "GPL-2.0-or-later"
 dependencies = ["python3"]
-tags = ["system", "hardware", "monitor", "gpu", "cpu", "sensors", "desktop"]
+tags = ["system", "hardware", "monitor", "gpu", "cpu", "sensors", "desktop", "storage"]
 icon = "gauge"
-description = "Dynamic KDE-style hardware sensor monitor with glowing Ring, Bar, and Histogram graphs for both Status Bar and Desktop."
+description = "Universal hardware and storage telemetry super-widget with modular face elements, glowing tachometers, and KDE-style sensor picker."
 
 [[setting]]
 key = "poll_interval_ms"
@@ -42,39 +39,43 @@ default = 96
 min = 56
 max = 160
 
-[[setting]]
-key = "desktop_columns"
-type = "int"
-label_key = "settings.desktop_columns.label"
-description_key = "settings.desktop_columns.description"
-default = 3
-min = 1
-max = 8
-
-[[setting]]
-key = "respect_gpu_sleep"
-type = "bool"
-label_key = "settings.respect_gpu_sleep.label"
-description_key = "settings.respect_gpu_sleep.description"
-default = false
-
 [[service]]
 id = "daemon"
 entry = "service.luau"
 
+# --- Bar Widget (User adds as many named instances as desired) ---
+
 [[widget]]
-id = "bar"
+id = "gauge"
 entry = "bar.luau"
+
+  [[widget.setting]]
+  key = "instance_id"
+  type = "string"
+  label_key = "settings.instance_id.label"
+  description_key = "settings.instance_id.description"
+  default = "default"
+
+# --- Desktop Widget (User adds as many named instances as desired) ---
 
 [[desktop_widget]]
 id = "desktop"
 entry = "desktop.luau"
 
+  [[desktop_widget.setting]]
+  key = "instance_id"
+  type = "string"
+  label_key = "settings.instance_id.label"
+  description_key = "settings.instance_id.description"
+  default = "default"
+
+# --- Interactive Configuration Studio & Sensor Picker ---
+
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-width = 680
-height = 560
+width = 820
+height = 680
 placement = "attached"
 position = "auto"
 open_near_click = true
