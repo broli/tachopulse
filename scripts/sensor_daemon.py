@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
-TachoPulse Sensor Discovery & Supersampled Graph Daemon for Noctalia v5.
+TachoPulse Telemetry Engine for Noctalia v5.
 
-Sensor identification and classification logic adapted from KDE Plasma's
-`ksystemstats` and `libksysguard` plugins:
-  - cpu:       /proc/stat, cpufreq sysfs, coretemp/k10temp hwmon
-  - gpu:       DRM sysfs (/sys/class/drm/card*) + nvtop -s / nvidia-smi / fdinfo
-  - memory:    /proc/meminfo (MemTotal - MemAvailable, Application, Swap)
-  - lmsensors: /sys/class/hwmon/hwmon* (temp*, fan*, power*, in*, curr*)
-  - disks:     /proc/diskstats + os.statvfs
-  - network:   /sys/class/net/* + /proc/net/dev
-  - power:     /sys/class/power_supply/*
-  - pressure:  /proc/pressure/{cpu,memory,io} (Linux PSI)
-
-License: GPL-2.0-or-later (crediting KDE Project Contributors for ksystemstats
-sensor classification and tordex/nvtop for capsule-arc gauge inspiration).
+Discovers hardware and storage sensors (storage, CPU, multi-GPU, RAM, thermals,
+fans, network transfer rates, battery, Linux PSI) and generates anti-aliased
+gauge graphics.
 """
 
+import argparse
+import copy
+import fcntl
 import glob
 import json
 import math
@@ -28,46 +21,156 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+    sys.stderr.write("TachoPulse warning: PIL/Pillow is not installed. Gauge graph rendering will be disabled.\n")
 
 RUNTIME_BASE = os.path.join(
     os.environ.get("XDG_RUNTIME_DIR", "/dev/shm"),
     "tachopulse",
 )
-STATE_FILE = os.path.join(RUNTIME_BASE, "state.json")
-CONFIG_FILE = os.path.join(RUNTIME_BASE, "config.json")
+ASSETS_DIR = os.path.join(RUNTIME_BASE, "assets")
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "noctalia",
+    "tachopulse",
+)
+INSTANCES_FILE = os.path.join(CONFIG_DIR, "instances.json")
+CMD_FILE = os.path.join(RUNTIME_BASE, "cmd.json")
 SNAPSHOT_FILE = os.path.join(RUNTIME_BASE, "snapshot.json")
-MAX_HISTORY = 40
+STATE_FILE = os.path.join(RUNTIME_BASE, "daemon_state.json")
+DAEMON_PID_FILE = os.path.join(RUNTIME_BASE, "daemon.pid")
+
+os.makedirs(RUNTIME_BASE, exist_ok=True)
+os.makedirs(ASSETS_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
 PALETTE_COLORS: Dict[str, Tuple[int, int, int]] = {
-    "blue": (120, 180, 255),
     "cyan": (86, 214, 214),
+    "blue": (120, 180, 255),
     "green": (115, 230, 155),
     "orange": (255, 185, 110),
     "purple": (195, 145, 255),
     "red": (255, 110, 125),
     "yellow": (250, 225, 115),
+    "white": (240, 245, 255),
 }
 
-SKINS = {
-    "dark": {
-        "track": (42, 45, 62, 235),
-        "bg_card": (26, 28, 40, 210),
-        "text": (238, 242, 252, 255),
-        "subtext": (150, 160, 182, 255),
-        "grid": (58, 62, 84, 150),
+
+def resolve_color(c: str) -> Tuple[int, int, int]:
+    if not c:
+        return PALETTE_COLORS["cyan"]
+    if c in PALETTE_COLORS:
+        return PALETTE_COLORS[c]
+    if c.startswith("#") and len(c) in (7, 9):
+        try:
+            return (int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16))
+        except ValueError:
+            pass
+    return PALETTE_COLORS["cyan"]
+
+TRACK_COLOR = (90, 100, 135, 235)
+
+DEFAULT_INSTANCES: Dict[str, Dict[str, Any]] = {
+    "default": {
+        "id": "default",
+        "name": "CPU Load",
+        "sensor_id": "cpu/total_usage",
+        "color": "cyan",
+        "show_icon": True,
+        "icon_type": "glyph",
+        "icon_val": "cpu",
+        "show_graph": True,
+        "graph_type": "tachometer_quarter",
+        "stroke_width": 7,
+        "show_value": True,
+        "decimals": 0,
+        "show_label": True,
+        "label": "CPU",
     },
-    "light": {
-        "track": (205, 210, 224, 235),
-        "bg_card": (242, 244, 250, 220),
-        "text": (28, 32, 42, 255),
-        "subtext": (92, 100, 118, 255),
-        "grid": (185, 192, 210, 150),
+    "cpu_temp": {
+        "id": "cpu_temp",
+        "name": "CPU Package Temp",
+        "sensor_id": "cpu/package_temp",
+        "color": "orange",
+        "show_icon": True,
+        "icon_type": "emoji",
+        "icon_val": "🔥",
+        "show_graph": True,
+        "graph_type": "tachometer_full",
+        "stroke_width": 7,
+        "show_value": True,
+        "decimals": 0,
+        "show_label": True,
+        "label": "Tctl",
+    },
+    "storage_free": {
+        "id": "storage_free",
+        "name": "Root Free Space",
+        "sensor_id": "storage/root/free_gb",
+        "color": "green",
+        "show_icon": True,
+        "icon_type": "glyph",
+        "icon_val": "database",
+        "show_graph": True,
+        "graph_type": "bar_vertical",
+        "stroke_width": 7,
+        "show_value": True,
+        "decimals": 1,
+        "show_label": True,
+        "label": "Free",
+    },
+    "wifi_net": {
+        "id": "wifi_net",
+        "name": "Network Signal / Rate",
+        "sensor_id": "net/wlan0/rx_rate",
+        "color": "blue",
+        "show_icon": True,
+        "icon_type": "glyph",
+        "icon_val": "wifi",
+        "show_graph": True,
+        "graph_type": "geometric_wifi",
+        "stroke_width": 7,
+        "show_value": True,
+        "decimals": 1,
+        "show_label": True,
+        "label": "DL",
     },
 }
+
+_PREV_CPU_TIMES: Dict[str, Tuple[int, int]] = {}
+_PREV_NET_BYTES: Dict[str, Tuple[int, int, float]] = {}
+
+_INSTANCE_FILES: Dict[str, Dict[str, str]] = {}
+_INSTANCE_RENDER_KEYS: Dict[str, Dict[str, Tuple]] = {}
+
+_NVTOP_AVAILABLE: Optional[bool] = None
+_NVIDIA_SMI_AVAILABLE: Optional[bool] = None
+
+
+def load_daemon_state() -> Tuple[Dict[str, Tuple[int, int]], Dict[str, Tuple[int, int, float]]]:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                cpu = {k: tuple(v) for k, v in d.get("cpu", {}).items()}
+                net = {k: tuple(v) for k, v in d.get("net", {}).items()}
+                return cpu, net
+        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+            pass
+    return {}, {}
+
+
+def save_daemon_state(cpu: Dict[str, Tuple[int, int]], net: Dict[str, Tuple[int, int, float]]) -> None:
+    tmp_path = STATE_FILE + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump({"cpu": cpu, "net": net}, f)
+        os.replace(tmp_path, STATE_FILE)
+    except OSError:
+        pass
 
 
 def read_text(path: str, default: str = "") -> str:
@@ -78,1289 +181,1548 @@ def read_text(path: str, default: str = "") -> str:
         return default
 
 
-def read_float(path: str, scale: float = 1.0) -> Optional[float]:
-    raw = read_text(path)
-    if not raw:
-        return None
+def format_rate_human(bytes_per_sec: float) -> str:
+    if bytes_per_sec < 1024:
+        return f"{int(bytes_per_sec)} B/s"
+    for unit in ["KB/s", "MB/s", "GB/s"]:
+        bytes_per_sec /= 1024.0
+        if bytes_per_sec < 1024:
+            return f"{bytes_per_sec:.1f} {unit}" if bytes_per_sec < 10 else f"{int(bytes_per_sec)} {unit}"
+    return f"{bytes_per_sec:.1f} GB/s"
+
+
+# ==============================================================================
+# Sensor Discovery & Scraper Engine
+# ==============================================================================
+
+def sample_filesystems() -> Dict[str, Dict[str, Any]]:
+    results = {}
+    ignored_fs = {
+        "tmpfs", "devtmpfs", "devpts", "sysfs", "proc", "cgroup", "cgroup2",
+        "securityfs", "pstore", "bpf", "autofs", "mqueue", "hugetlbfs",
+        "debugfs", "tracefs", "fusectl", "configfs", "ramfs", "binfmt_misc",
+        "efivarfs", "overlay", "squashfs",
+    }
+    seen_stats = set()
+
     try:
-        return float(raw) * scale
-    except ValueError:
-        return None
-
-
-def format_bytes(num_bytes: float) -> str:
-    if num_bytes < 0:
-        num_bytes = 0
-    gb = num_bytes / (1024 ** 3)
-    if gb >= 1.0:
-        return f"{gb:.1f}G"
-    mb = num_bytes / (1024 ** 2)
-    if mb >= 1.0:
-        return f"{mb:.0f}M"
-    kb = num_bytes / 1024.0
-    return f"{kb:.0f}K"
-
-
-def format_rate(bytes_per_sec: float) -> str:
-    if bytes_per_sec < 0:
-        bytes_per_sec = 0
-    mb = bytes_per_sec / (1024 ** 2)
-    if mb >= 1.0:
-        return f"{mb:.1f}M/s"
-    kb = bytes_per_sec / 1024.0
-    if kb >= 1.0:
-        return f"{kb:.0f}K/s"
-    return f"{bytes_per_sec:.0f}B/s"
-
-
-# ---------------------------------------------------------------------------
-# Font helper for Pillow 3x supersampled rendering
-# ---------------------------------------------------------------------------
-_FONT_CACHE: Dict[Tuple[int, bool], Any] = {}
-
-
-def get_font(px_size: int, bold: bool = False) -> Any:
-    key = (px_size, bold)
-    if key in _FONT_CACHE:
-        return _FONT_CACHE[key]
-    candidates = (
-        [
-            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
-            "/usr/share/fonts/liberation/LiberationSans-Bold.ttf",
-            "DejaVuSans-Bold.ttf",
-        ]
-        if bold
-        else [
-            "/usr/share/fonts/TTF/DejaVuSans.ttf",
-            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
-            "DejaVuSans.ttf",
-        ]
-    )
-    for name in candidates:
-        try:
-            font = ImageFont.truetype(name, px_size)
-            _FONT_CACHE[key] = font
-            return font
-        except OSError:
-            continue
-    font = ImageFont.load_default()
-    _FONT_CACHE[key] = font
-    return font
-
-
-# ---------------------------------------------------------------------------
-# KDE ksystemstats-inspired Sensor Discovery & Polling Engine
-# ---------------------------------------------------------------------------
-class KdeStyleSensorEngine:
-    def __init__(self, prev_state: Dict[str, Any], respect_gpu_sleep: bool = False):
-        self.prev_state = prev_state
-        self.respect_gpu_sleep = respect_gpu_sleep
-        self.now = time.time()
-        self.dt = max(0.05, self.now - float(prev_state.get("timestamp", self.now - 1.0)))
-        self.new_state: Dict[str, Any] = {
-            "timestamp": self.now,
-            "cpu_ticks": {},
-            "disk_io": {},
-            "net_io": {},
-            "history": prev_state.get("history", {}),
-        }
-        self.sensors: Dict[str, Dict[str, Any]] = {}
-
-    def register(
-        self,
-        sensor_id: str,
-        category: str,
-        name: str,
-        short_label: str,
-        value: float,
-        unit: str,
-        val_text: str,
-        sub_text: str = "",
-        percent: Optional[float] = None,
-        min_val: float = 0.0,
-        max_val: float = 100.0,
-        icon: str = "cpu",
-        default_color: str = "blue",
-    ) -> None:
-        if percent is None:
-            if max_val > min_val:
-                percent = max(0.0, min(100.0, (value - min_val) / (max_val - min_val) * 100.0))
-            else:
-                percent = 0.0
-        else:
-            percent = max(0.0, min(100.0, float(percent)))
-
-        hist_map = self.new_state["history"]
-        hist = list(hist_map.get(sensor_id, []))
-        hist.append(round(percent, 1))
-        if len(hist) > MAX_HISTORY:
-            hist = hist[-MAX_HISTORY:]
-        hist_map[sensor_id] = hist
-
-        self.sensors[sensor_id] = {
-            "id": sensor_id,
-            "category": category,
-            "name": name,
-            "short_label": short_label,
-            "value": round(float(value), 2),
-            "unit": unit,
-            "val_text": val_text,
-            "sub_text": sub_text,
-            "percent": round(percent, 1),
-            "history": hist,
-            "icon": icon,
-            "default_color": default_color,
-        }
-
-    def collect_all(self) -> Dict[str, Dict[str, Any]]:
-        hwmon_summary = self._collect_lmsensors()
-        self._collect_cpu(hwmon_summary)
-        self._collect_memory()
-        self._collect_gpus()
-        self._collect_disks()
-        self._collect_network()
-        self._collect_power()
-        self._collect_pressure()
-        return self.sensors
-
-    def _collect_lmsensors(self) -> Dict[str, Any]:
-        """Scans /sys/class/hwmon/hwmon* using KDE lmsensors plugin conventions."""
-        summary: Dict[str, Any] = {"cpu_pkg_temp": None, "cpu_max_temp": None}
-        chip_counts: Dict[str, int] = {}
-        # Sort by real device path so multi-instance chips (e.g. DDR5 spd5118) have reboot-stable order
-        hw_dirs = sorted(
-            glob.glob("/sys/class/hwmon/hwmon*"),
-            key=lambda p: (
-                read_text(os.path.join(p, "name"), ""),
-                os.path.realpath(os.path.join(p, "device")) if os.path.exists(os.path.join(p, "device")) else p,
-            ),
-        )
-        for hw_dir in hw_dirs:
-            chip = read_text(os.path.join(hw_dir, "name"), os.path.basename(hw_dir))
-            cnt = chip_counts.get(chip, 0) + 1
-            chip_counts[chip] = cnt
-            chip_key = chip if cnt == 1 else f"{chip}_{cnt}"
-
-            # Temperatures (millidegrees C)
-            for inp in sorted(glob.glob(os.path.join(hw_dir, "temp*_input"))):
-                prefix = inp[:-6]  # strip _input
-                t_id = os.path.basename(prefix)
-                val_c = read_float(inp, 0.001)
-                if val_c is None or val_c <= -50 or val_c >= 200:
+        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 3:
                     continue
-                label = read_text(prefix + "_label", f"{chip} {t_id}")
-                crit = read_float(prefix + "_crit", 0.001) or read_float(prefix + "_max", 0.001) or 100.0
-                if crit <= 0 or crit > 150:
-                    crit = 100.0
-
-                if chip in ("coretemp", "k10temp", "zenpower", "cpu_thermal"):
-                    if "package" in label.lower() or "tctl" in label.lower() or "tdie" in label.lower() or summary["cpu_pkg_temp"] is None:
-                        summary["cpu_pkg_temp"] = val_c
-                    if summary["cpu_max_temp"] is None or val_c > summary["cpu_max_temp"]:
-                        summary["cpu_max_temp"] = val_c
-
-                sid = f"lmsensors/{chip_key}/{t_id}"
-                short = label[:6].upper() if len(label) <= 6 else chip[:6].upper()
-                self.register(
-                    sensor_id=sid,
-                    category="Hardware Sensors (hwmon)",
-                    name=f"{chip_key}: {label} Temp",
-                    short_label=short,
-                    value=val_c,
-                    unit="°C",
-                    val_text=f"{val_c:.0f}°C",
-                    sub_text=f"max {crit:.0f}°C",
-                    min_val=20.0,
-                    max_val=crit,
-                    icon="temperature",
-                    default_color="orange" if val_c >= 70 else "cyan",
-                )
-
-            # Fans (RPM)
-            for inp in sorted(glob.glob(os.path.join(hw_dir, "fan*_input"))):
-                prefix = inp[:-6]
-                f_id = os.path.basename(prefix)
-                rpm = read_float(inp, 1.0)
-                if rpm is None or rpm < 0:
+                dev, mount, fstype = parts[0], parts[1], parts[2]
+                if fstype in ignored_fs or not dev.startswith("/dev/"):
                     continue
-                label = read_text(prefix + "_label", f"{chip} {f_id}")
-                max_rpm = read_float(prefix + "_max", 1.0) or 5500.0
-                if max_rpm <= 0:
-                    max_rpm = 5500.0
-                sid = f"lmsensors/{chip_key}/{f_id}"
-                short = "CPUFAN" if "cpu" in label.lower() else ("GPUFAN" if "gpu" in label.lower() else "FAN")
-                self.register(
-                    sensor_id=sid,
-                    category="Fans & Cooling",
-                    name=f"{chip_key}: {label}",
-                    short_label=short,
-                    value=rpm,
-                    unit="RPM",
-                    val_text=f"{rpm:.0f}",
-                    sub_text="RPM",
-                    min_val=0.0,
-                    max_val=max_rpm,
-                    icon="car-fan",
-                    default_color="green",
-                )
 
-            # Power sensors (microwatts -> Watts)
-            for inp in sorted(glob.glob(os.path.join(hw_dir, "power*_input"))):
-                prefix = inp[:-6]
-                p_id = os.path.basename(prefix)
-                watts = read_float(inp, 1e-6)
-                if watts is None or watts < 0:
+                if mount in {"/var/tmp", "/var/cache", "/var/log", "/root", "/srv"}:
                     continue
-                label = read_text(prefix + "_label", f"{chip} {p_id}")
-                max_w = read_float(prefix + "_max", 1e-6) or 100.0
-                sid = f"lmsensors/{chip_key}/{p_id}"
-                self.register(
-                    sensor_id=sid,
-                    category="Power & Voltage",
-                    name=f"{chip_key}: {label} Power",
-                    short_label="PWR",
-                    value=watts,
-                    unit="W",
-                    val_text=f"{watts:.1f}W",
-                    sub_text=chip_key,
-                    min_val=0.0,
-                    max_val=max_w,
-                    icon="bolt",
-                    default_color="yellow",
-                )
 
-        return summary
-
-    def _collect_cpu(self, hwmon_summary: Dict[str, Any]) -> None:
-        prev_ticks = self.prev_state.get("cpu_ticks", {})
-        cur_ticks: Dict[str, Tuple[int, int]] = {}
-        usages: Dict[str, float] = {}
-
-        try:
-            with open("/proc/stat", "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.startswith("cpu"):
+                try:
+                    st = os.statvfs(mount)
+                    total_bytes = st.f_blocks * st.f_frsize
+                    free_bytes = st.f_bavail * st.f_frsize
+                    if total_bytes == 0:
                         continue
-                    parts = line.split()
-                    cpu_name = parts[0]
-                    nums = [int(x) for x in parts[1:9]]
-                    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
-                    total = sum(nums)
-                    cur_ticks[cpu_name] = (total, idle)
-                    if cpu_name in prev_ticks:
-                        p_tot, p_idle = prev_ticks[cpu_name]
-                        d_tot = total - p_tot
-                        d_idle = idle - p_idle
-                        if d_tot > 0:
-                            usages[cpu_name] = max(0.0, min(100.0, (1.0 - d_idle / d_tot) * 100.0))
-                        else:
-                            usages[cpu_name] = 0.0
+                    used_bytes = total_bytes - free_bytes
+                    used_pct = (used_bytes / total_bytes) * 100.0
+                    free_pct = (free_bytes / total_bytes) * 100.0
+
+                    sig = (dev, total_bytes, round(free_bytes / (1024 * 1024 * 100)))
+                    if sig in seen_stats and mount not in {"/", "/home"}:
+                        continue
+                    seen_stats.add(sig)
+
+                    if mount == "/":
+                        mount_name = "Root (/)"
+                        slug = "root"
+                    elif mount == "/home":
+                        mount_name = "Home (/home)"
+                        slug = "home"
+                    elif mount == "/boot":
+                        mount_name = "Boot (/boot)"
+                        slug = "boot"
                     else:
-                        usages[cpu_name] = 0.0
-        except OSError:
-            pass
+                        mount_name = f"{os.path.basename(mount.rstrip('/'))} ({mount})"
+                        slug = re.sub(r"[^a-zA-Z0-9_]", "_", mount.strip("/")).lower()
 
-        self.new_state["cpu_ticks"] = cur_ticks
+                    total_gb = total_bytes / (1024**3)
+                    free_gb = free_bytes / (1024**3)
+                    used_gb = used_bytes / (1024**3)
 
-        # CPU frequencies (kHz -> GHz)
-        freqs_ghz: List[float] = []
-        for fpath in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"):
-            ghz = read_float(fpath, 1e-6)
-            if ghz is not None:
-                freqs_ghz.append(ghz)
-        avg_ghz = sum(freqs_ghz) / len(freqs_ghz) if freqs_ghz else 0.0
-        max_ghz = max(freqs_ghz) if freqs_ghz else 0.0
+                    id_free = f"storage/{slug}/free_gb"
+                    results[id_free] = {
+                        "id": id_free,
+                        "category": "Storage",
+                        "name": f"Storage: {mount_name} - Free Space",
+                        "short_label": "FREE",
+                        "value": round(free_gb, 1),
+                        "val_text": f"{free_gb:.1f} GB" if free_gb < 1000 else f"{free_gb/1024:.2f} TB",
+                        "unit": "GB",
+                        "min": 0,
+                        "max": round(total_gb, 1),
+                        "pct": free_pct / 100.0,
+                        "icon": "database",
+                        "default_color": "green",
+                    }
 
-        pkg_temp = hwmon_summary.get("cpu_pkg_temp")
-        sub_cpu = f"{pkg_temp:.0f}°C" if pkg_temp is not None else (f"{avg_ghz:.1f}GHz" if avg_ghz > 0 else "")
+                    id_free_pct = f"storage/{slug}/free_pct"
+                    results[id_free_pct] = {
+                        "id": id_free_pct,
+                        "category": "Storage",
+                        "name": f"Storage: {mount_name} - Free %",
+                        "short_label": "FREE%",
+                        "value": round(free_pct, 1),
+                        "val_text": f"{free_pct:.0f}%",
+                        "unit": "%",
+                        "min": 0,
+                        "max": 100,
+                        "pct": free_pct / 100.0,
+                        "icon": "database",
+                        "default_color": "green",
+                    }
 
-        total_usage = usages.get("cpu", 0.0)
-        self.register(
-            sensor_id="cpu/all/usage",
-            category="CPU",
-            name="CPU Total Load",
-            short_label="CPU",
-            value=total_usage,
-            unit="%",
-            val_text=f"{total_usage:.0f}%",
-            sub_text=sub_cpu,
-            percent=total_usage,
-            icon="cpu",
-            default_color="blue",
-        )
+                    id_used = f"storage/{slug}/used_gb"
+                    results[id_used] = {
+                        "id": id_used,
+                        "category": "Storage",
+                        "name": f"Storage: {mount_name} - Used Space",
+                        "short_label": "USED",
+                        "value": round(used_gb, 1),
+                        "val_text": f"{used_gb:.1f} GB" if used_gb < 1000 else f"{used_gb/1024:.2f} TB",
+                        "unit": "GB",
+                        "min": 0,
+                        "max": round(total_gb, 1),
+                        "pct": used_pct / 100.0,
+                        "icon": "database",
+                        "default_color": "orange",
+                    }
 
-        if pkg_temp is not None:
-            self.register(
-                sensor_id="cpu/all/temperature",
-                category="CPU",
-                name="CPU Package Temperature",
-                short_label="CPUTMP",
-                value=pkg_temp,
-                unit="°C",
-                val_text=f"{pkg_temp:.0f}°C",
-                sub_text=f"{avg_ghz:.1f}GHz" if avg_ghz > 0 else "Package",
-                min_val=25.0,
-                max_val=100.0,
-                icon="temperature",
-                default_color="orange",
-            )
+                    id_used_pct = f"storage/{slug}/used_pct"
+                    results[id_used_pct] = {
+                        "id": id_used_pct,
+                        "category": "Storage",
+                        "name": f"Storage: {mount_name} - Used %",
+                        "short_label": "USED%",
+                        "value": round(used_pct, 1),
+                        "val_text": f"{used_pct:.0f}%",
+                        "unit": "%",
+                        "min": 0,
+                        "max": 100,
+                        "pct": used_pct / 100.0,
+                        "icon": "database",
+                        "default_color": "orange",
+                    }
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return results
 
-        if avg_ghz > 0:
-            self.register(
-                sensor_id="cpu/all/averageFrequency",
-                category="CPU",
-                name="CPU Average Clock",
-                short_label="CLK",
-                value=avg_ghz,
-                unit="GHz",
-                val_text=f"{avg_ghz:.2f}G",
-                sub_text=f"max {max_ghz:.1f}G",
-                min_val=0.4,
-                max_val=max(5.5, max_ghz),
-                icon="bolt",
-                default_color="cyan",
-            )
 
-        try:
-            l1, l5, _ = os.getloadavg()
-            ncpu = max(1, os.cpu_count() or 1)
-            self.register(
-                sensor_id="cpu/all/loadaverage1",
-                category="CPU",
-                name="System Load Average (1m)",
-                short_label="LOAD",
-                value=l1,
-                unit="",
-                val_text=f"{l1:.2f}",
-                sub_text=f"5m {l5:.1f}",
-                min_val=0.0,
-                max_val=float(ncpu),
-                icon="activity",
-                default_color="purple",
-            )
-        except OSError:
-            pass
+def sample_cpu() -> Dict[str, Dict[str, Any]]:
+    global _PREV_CPU_TIMES
+    results = {}
 
-        # Individual CPU cores (sorted numerically)
-        core_keys = sorted(
-            [k for k in usages.keys() if k != "cpu"],
-            key=lambda x: int(x[3:]) if x[3:].isdigit() else 999,
-        )
-        for ck in core_keys:
-            idx = ck[3:]
-            u = usages[ck]
-            self.register(
-                sensor_id=f"cpu/{ck}/usage",
-                category="CPU Cores",
-                name=f"CPU Core {idx} Load",
-                short_label=f"C{idx}",
-                value=u,
-                unit="%",
-                val_text=f"{u:.0f}%",
-                sub_text=f"Core {idx}",
-                percent=u,
-                icon="cpu",
-                default_color="blue",
-            )
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.startswith("cpu"):
+                    continue
+                parts = line.split()
+                name = parts[0]
+                user = int(parts[1])
+                nice = int(parts[2])
+                system = int(parts[3])
+                idle = int(parts[4])
+                iowait = int(parts[5]) if len(parts) > 5 else 0
+                irq = int(parts[6]) if len(parts) > 6 else 0
+                softirq = int(parts[7]) if len(parts) > 7 else 0
+                steal = int(parts[8]) if len(parts) > 8 else 0
 
-    def _collect_memory(self) -> None:
-        info: Dict[str, int] = {}
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split(":")
-                    if len(parts) == 2:
-                        k = parts[0].strip()
-                        v_parts = parts[1].strip().split()
-                        if v_parts and v_parts[0].isdigit():
-                            info[k] = int(v_parts[0]) * 1024
-        except OSError:
-            return
+                idle_time = idle + iowait
+                non_idle = user + nice + system + irq + softirq + steal
+                total_time = idle_time + non_idle
 
-        total = info.get("MemTotal", 0)
-        avail = info.get("MemAvailable", info.get("MemFree", 0))
-        self._mem_total_bytes = total
-        self._shmem_bytes = info.get("Shmem", 0)
-        if total > 0:
-            used = max(0, total - avail)
-            pct = used / total * 100.0
-            self.register(
-                sensor_id="memory/physical/usedPercent",
-                category="Memory",
-                name="RAM Usage",
-                short_label="RAM",
-                value=pct,
-                unit="%",
-                val_text=format_bytes(used),
-                sub_text=f"+{format_bytes(avail)}",
-                percent=pct,
-                icon="server-2",
-                default_color="purple",
-            )
+                prev_total, prev_idle = _PREV_CPU_TIMES.get(name, (0, 0))
+                _PREV_CPU_TIMES[name] = (total_time, idle_time)
 
-        swap_total = info.get("SwapTotal", 0)
-        swap_free = info.get("SwapFree", 0)
+                diff_total = total_time - prev_total
+                diff_idle = idle_time - prev_idle
+
+                if diff_total > 0:
+                    pct = max(0.0, min(100.0, ((diff_total - diff_idle) / diff_total) * 100.0))
+                else:
+                    pct = 0.0
+
+                if name == "cpu":
+                    results["cpu/total_usage"] = {
+                        "id": "cpu/total_usage",
+                        "category": "CPU",
+                        "name": "CPU Total Load",
+                        "short_label": "CPU",
+                        "value": round(pct, 1),
+                        "val_text": f"{pct:.0f}%",
+                        "unit": "%",
+                        "min": 0,
+                        "max": 100,
+                        "pct": pct / 100.0,
+                        "icon": "cpu",
+                        "default_color": "cyan",
+                    }
+                else:
+                    core_num = name.replace("cpu", "")
+                    results[f"cpu/core_{core_num}"] = {
+                        "id": f"cpu/core_{core_num}",
+                        "category": "CPU Cores",
+                        "name": f"CPU Core {core_num} Load",
+                        "short_label": f"C{core_num}",
+                        "value": round(pct, 1),
+                        "val_text": f"{pct:.0f}%",
+                        "unit": "%",
+                        "min": 0,
+                        "max": 100,
+                        "pct": pct / 100.0,
+                        "icon": "cpu",
+                        "default_color": "cyan",
+                    }
+    except OSError:
+        pass
+
+    freq_files = glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")
+    if freq_files:
+        freqs_mhz = []
+        for path in freq_files:
+            txt = read_text(path)
+            if txt.isdigit():
+                freqs_mhz.append(int(txt) / 1000.0)
+        if freqs_mhz:
+            avg_mhz = sum(freqs_mhz) / len(freqs_mhz)
+            val_ghz = avg_mhz / 1000.0
+            results["cpu/clock_avg"] = {
+                "id": "cpu/clock_avg",
+                "category": "CPU",
+                "name": "CPU Average Clock",
+                "short_label": "CLK",
+                "value": round(val_ghz, 2),
+                "val_text": f"{val_ghz:.2f} GHz",
+                "unit": "GHz",
+                "min": 0,
+                "max": 6.0,
+                "pct": max(0.0, min(1.0, val_ghz / 6.0)),
+                "icon": "bolt",
+                "default_color": "yellow",
+            }
+
+    try:
+        load1, _, _ = os.getloadavg()
+        cores = float(os.cpu_count() or 4)
+        results["cpu/loadavg_1m"] = {
+            "id": "cpu/loadavg_1m",
+            "category": "CPU",
+            "name": "System Load Average (1m)",
+            "short_label": "LOAD",
+            "value": round(load1, 2),
+            "val_text": f"{load1:.2f}",
+            "unit": "",
+            "min": 0,
+            "max": cores,
+            "pct": min(1.0, max(0.0, load1 / cores)),
+            "icon": "activity",
+            "default_color": "purple",
+        }
+    except OSError:
+        pass
+
+    return results
+
+
+def sample_memory() -> Dict[str, Dict[str, Any]]:
+    results = {}
+    try:
+        meminfo = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    val_parts = parts[1].strip().split()
+                    if val_parts and val_parts[0].isdigit():
+                        meminfo[parts[0].strip()] = int(val_parts[0])
+
+        total_kb = meminfo.get("MemTotal", 0)
+        avail_kb = meminfo.get("MemAvailable", 0)
+        if total_kb > 0:
+            used_kb = total_kb - avail_kb
+            pct = (used_kb / total_kb) * 100.0
+            used_gb = used_kb / (1024 * 1024)
+            total_gb = total_kb / (1024 * 1024)
+            free_gb = avail_kb / (1024 * 1024)
+
+            results["memory/ram_used_pct"] = {
+                "id": "memory/ram_used_pct",
+                "category": "Memory",
+                "name": "Physical RAM Usage (%)",
+                "short_label": "RAM",
+                "value": round(pct, 1),
+                "val_text": f"{pct:.0f}%",
+                "unit": "%",
+                "min": 0,
+                "max": 100,
+                "pct": pct / 100.0,
+                "icon": "device-desktop-analytics",
+                "default_color": "purple",
+            }
+            results["memory/ram_used_gb"] = {
+                "id": "memory/ram_used_gb",
+                "category": "Memory",
+                "name": "Physical RAM Used (GB)",
+                "short_label": "RAM",
+                "value": round(used_gb, 1),
+                "val_text": f"{used_gb:.1f} GB",
+                "unit": "GB",
+                "min": 0,
+                "max": round(total_gb, 1),
+                "pct": pct / 100.0,
+                "icon": "device-desktop-analytics",
+                "default_color": "purple",
+            }
+            results["memory/ram_free_gb"] = {
+                "id": "memory/ram_free_gb",
+                "category": "Memory",
+                "name": "Physical RAM Available (GB)",
+                "short_label": "AVAL",
+                "value": round(free_gb, 1),
+                "val_text": f"{free_gb:.1f} GB",
+                "unit": "GB",
+                "min": 0,
+                "max": round(total_gb, 1),
+                "pct": max(0.0, min(1.0, free_gb / total_gb)),
+                "icon": "device-desktop-analytics",
+                "default_color": "green",
+            }
+
+        swap_total = meminfo.get("SwapTotal", 0)
+        swap_free = meminfo.get("SwapFree", 0)
         if swap_total > 0:
-            swap_used = max(0, swap_total - swap_free)
-            swap_pct = swap_used / swap_total * 100.0
-            self.register(
-                sensor_id="memory/swap/usedPercent",
-                category="Memory",
-                name="Swap Usage",
-                short_label="SWAP",
-                value=swap_pct,
-                unit="%",
-                val_text=format_bytes(swap_used),
-                sub_text=f"{swap_pct:.0f}%",
-                percent=swap_pct,
-                icon="arrows-exchange",
-                default_color="orange",
-            )
+            swap_used = swap_total - swap_free
+            swap_pct = (swap_used / swap_total) * 100.0
+            results["memory/swap_used_pct"] = {
+                "id": "memory/swap_used_pct",
+                "category": "Memory",
+                "name": "Swap Memory Usage (%)",
+                "short_label": "SWAP",
+                "value": round(swap_pct, 1),
+                "val_text": f"{swap_pct:.0f}%",
+                "unit": "%",
+                "min": 0,
+                "max": 100,
+                "pct": swap_pct / 100.0,
+                "icon": "stack-2",
+                "default_color": "orange",
+            }
+    except OSError:
+        pass
 
-    def _collect_gpus(self) -> None:
-        """
-        Discovers all GPUs dynamically via `nvtop -s` (which supports NVIDIA,
-        AMD, and Intel iGPUs including per-process fdinfo memory/load) and
-        supplements with /sys/class/drm/card* sysfs.
-        """
-        nvtop_gpus: List[Dict[str, Any]] = []
+    return results
+
+
+_NUM_RE = re.compile(r"[-+]?\d*\.?\d+")
+
+
+def _parse_num(val: Any) -> float:
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    m = _NUM_RE.search(str(val))
+    return float(m.group(0)) if m else 0.0
+
+
+def sample_gpus() -> Dict[str, Dict[str, Any]]:
+    global _NVTOP_AVAILABLE, _NVIDIA_SMI_AVAILABLE
+    results = {}
+    has_gpus = False
+
+    if _NVTOP_AVAILABLE is not False:
         try:
             proc = subprocess.run(
                 ["nvtop", "-s"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                capture_output=True,
                 text=True,
                 timeout=1.5,
-                check=False,
             )
             if proc.returncode == 0 and proc.stdout.strip():
-                parsed = json.loads(proc.stdout)
-                if isinstance(parsed, list):
-                    nvtop_gpus = parsed
-        except Exception:
-            nvtop_gpus = []
+                _NVTOP_AVAILABLE = True
+                raw_data = json.loads(proc.stdout)
+                devices = raw_data if isinstance(raw_data, list) else raw_data.get("devices", [])
+                for idx, g in enumerate(devices):
+                    has_gpus = True
+                    raw_name = g.get("device_name") or f"GPU {idx}"
+                    clean_name = raw_name.replace(" Laptop GPU", "").replace(" Graphics", "")
+                    gpu_slug = f"gpu_{idx}"
+                    cat = "GPU"
 
-        # Also inspect /sys/class/drm/card* for Intel GT clocks or cards not in nvtop
-        drm_cards: List[Dict[str, Any]] = []
-        for card_path in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
-            base = os.path.basename(card_path)
-            if "-" in base:
+                    load = _parse_num(g.get("gpu_util"))
+                    results[f"{gpu_slug}/load"] = {
+                        "id": f"{gpu_slug}/load",
+                        "category": cat,
+                        "name": f"{clean_name} - Core Utilization",
+                        "short_label": "GPU",
+                        "value": round(load, 1),
+                        "val_text": f"{load:.0f}%",
+                        "unit": "%",
+                        "min": 0,
+                        "max": 100,
+                        "pct": max(0.0, min(1.0, load / 100.0)),
+                        "icon": "device-gamepad",
+                        "default_color": "green",
+                    }
+
+                    clock = _parse_num(g.get("gpu_clock"))
+                    if clock > 0:
+                        results[f"{gpu_slug}/core_clock"] = {
+                            "id": f"{gpu_slug}/core_clock",
+                            "category": cat,
+                            "name": f"{clean_name} - Core Clock",
+                            "short_label": "GCLK",
+                            "value": round(clock, 0),
+                            "val_text": f"{clock:.0f} MHz",
+                            "unit": "MHz",
+                            "min": 0,
+                            "max": 3000,
+                            "pct": max(0.0, min(1.0, clock / 3000.0)),
+                            "icon": "bolt",
+                            "default_color": "yellow",
+                        }
+
+                    mem_total = _parse_num(g.get("mem_total"))
+                    mem_used = _parse_num(g.get("mem_used"))
+                    mem_util = _parse_num(g.get("mem_util"))
+                    if mem_total > 0:
+                        total_gb = mem_total / (1024**3)
+                        used_gb = mem_used / (1024**3)
+                        free_gb = max(0.0, total_gb - used_gb)
+                        vram_pct = mem_util if mem_util > 0 else ((used_gb / total_gb) * 100.0 if total_gb > 0 else 0.0)
+
+                        if mem_used > 0 or mem_util > 0:
+                            results[f"{gpu_slug}/vram_pct"] = {
+                                "id": f"{gpu_slug}/vram_pct",
+                                "category": cat,
+                                "name": f"{clean_name} - VRAM Usage (%)",
+                                "short_label": "VRAM%",
+                                "value": round(vram_pct, 1),
+                                "val_text": f"{vram_pct:.0f}%",
+                                "unit": "%",
+                                "min": 0,
+                                "max": 100,
+                                "pct": max(0.0, min(1.0, vram_pct / 100.0)),
+                                "icon": "database",
+                                "default_color": "blue",
+                            }
+                            results[f"{gpu_slug}/vram_used"] = {
+                                "id": f"{gpu_slug}/vram_used",
+                                "category": cat,
+                                "name": f"{clean_name} - VRAM Used (GB)",
+                                "short_label": "VRAM",
+                                "value": round(used_gb, 2),
+                                "val_text": f"{used_gb:.1f} GB",
+                                "unit": "GB",
+                                "min": 0,
+                                "max": round(total_gb, 1),
+                                "pct": max(0.0, min(1.0, used_gb / total_gb)) if total_gb > 0 else 0.0,
+                                "icon": "database",
+                                "default_color": "blue",
+                            }
+                            results[f"{gpu_slug}/vram_free"] = {
+                                "id": f"{gpu_slug}/vram_free",
+                                "category": cat,
+                                "name": f"{clean_name} - VRAM Free (GB)",
+                                "short_label": "VFREE",
+                                "value": round(free_gb, 2),
+                                "val_text": f"{free_gb:.1f} GB",
+                                "unit": "GB",
+                                "min": 0,
+                                "max": round(total_gb, 1),
+                                "pct": max(0.0, min(1.0, free_gb / total_gb)) if total_gb > 0 else 0.0,
+                                "icon": "database",
+                                "default_color": "green",
+                            }
+
+                    mem_clock = _parse_num(g.get("mem_clock"))
+                    if mem_clock > 0:
+                        results[f"{gpu_slug}/mem_clock"] = {
+                            "id": f"{gpu_slug}/mem_clock",
+                            "category": cat,
+                            "name": f"{clean_name} - Memory Clock",
+                            "short_label": "MCLK",
+                            "value": round(mem_clock, 0),
+                            "val_text": f"{mem_clock:.0f} MHz",
+                            "unit": "MHz",
+                            "min": 0,
+                            "max": 10000,
+                            "pct": max(0.0, min(1.0, mem_clock / 10000.0)),
+                            "icon": "bolt",
+                            "default_color": "purple",
+                        }
+
+                    temp = _parse_num(g.get("temp"))
+                    if temp > 0:
+                        results[f"{gpu_slug}/temp"] = {
+                            "id": f"{gpu_slug}/temp",
+                            "category": cat,
+                            "name": f"{clean_name} - Temperature",
+                            "short_label": "GTEMP",
+                            "value": round(temp, 1),
+                            "val_text": f"{temp:.0f}°C",
+                            "unit": "°C",
+                            "min": 0,
+                            "max": 105,
+                            "pct": max(0.0, min(1.0, temp / 105.0)),
+                            "icon": "flame",
+                            "default_color": "orange",
+                        }
+
+                    power = _parse_num(g.get("power_draw"))
+                    if power > 0:
+                        results[f"{gpu_slug}/power"] = {
+                            "id": f"{gpu_slug}/power",
+                            "category": cat,
+                            "name": f"{clean_name} - Power Draw",
+                            "short_label": "GPWR",
+                            "value": round(power, 1),
+                            "val_text": f"{power:.1f} W",
+                            "unit": "W",
+                            "min": 0,
+                            "max": 250,
+                            "pct": max(0.0, min(1.0, power / 250.0)),
+                            "icon": "bolt",
+                            "default_color": "yellow",
+                        }
+            else:
+                _NVTOP_AVAILABLE = False
+        except FileNotFoundError:
+            _NVTOP_AVAILABLE = False
+        except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+            pass
+
+    if not has_gpus and _NVIDIA_SMI_AVAILABLE is not False:
+        try:
+            cmd = [
+                "nvidia-smi",
+                "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw,clocks.current.graphics,clocks.current.memory",
+                "--format=csv,noheader,nounits",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1.5)
+            if proc.returncode == 0 and proc.stdout.strip():
+                _NVIDIA_SMI_AVAILABLE = True
+                for line in proc.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 11:
+                        has_gpus = True
+                        idx = parts[0]
+                        name = parts[1].replace(" Laptop GPU", "").replace(" Graphics", "")
+                        gpu_slug = f"gpu_{idx}"
+                        cat = "GPU"
+                        load = _parse_num(parts[2])
+                        vram_pct = _parse_num(parts[3])
+                        total_mb = _parse_num(parts[4])
+                        used_mb = _parse_num(parts[5])
+                        free_mb = _parse_num(parts[6])
+                        temp = _parse_num(parts[7])
+                        power = _parse_num(parts[8])
+                        gclk = _parse_num(parts[9])
+                        mclk = _parse_num(parts[10])
+
+                        results[f"{gpu_slug}/load"] = {
+                            "id": f"{gpu_slug}/load",
+                            "category": cat,
+                            "name": f"{name} - Core Utilization",
+                            "short_label": "GPU",
+                            "value": round(load, 1),
+                            "val_text": f"{load:.0f}%",
+                            "unit": "%",
+                            "min": 0,
+                            "max": 100,
+                            "pct": max(0.0, min(1.0, load / 100.0)),
+                            "icon": "device-gamepad",
+                            "default_color": "green",
+                        }
+                        if gclk > 0:
+                            results[f"{gpu_slug}/core_clock"] = {
+                                "id": f"{gpu_slug}/core_clock",
+                                "category": cat,
+                                "name": f"{name} - Core Clock",
+                                "short_label": "GCLK",
+                                "value": round(gclk, 0),
+                                "val_text": f"{gclk:.0f} MHz",
+                                "unit": "MHz",
+                                "min": 0,
+                                "max": 3000,
+                                "pct": max(0.0, min(1.0, gclk / 2600.0)),
+                                "icon": "bolt",
+                                "default_color": "yellow",
+                            }
+                        results[f"{gpu_slug}/vram_pct"] = {
+                            "id": f"{gpu_slug}/vram_pct",
+                            "category": cat,
+                            "name": f"{name} - VRAM Usage (%)",
+                            "short_label": "VRAM%",
+                            "value": round(vram_pct, 1),
+                            "val_text": f"{vram_pct:.0f}%",
+                            "unit": "%",
+                            "min": 0,
+                            "max": 100,
+                            "pct": max(0.0, min(1.0, vram_pct / 100.0)),
+                            "icon": "database",
+                            "default_color": "blue",
+                        }
+                        if total_mb > 0:
+                            used_gb = used_mb / 1024.0
+                            free_gb = free_mb / 1024.0
+                            total_gb = total_mb / 1024.0
+                            results[f"{gpu_slug}/vram_used"] = {
+                                "id": f"{gpu_slug}/vram_used",
+                                "category": cat,
+                                "name": f"{name} - VRAM Used (GB)",
+                                "short_label": "VRAM",
+                                "value": round(used_gb, 2),
+                                "val_text": f"{used_gb:.1f} GB",
+                                "unit": "GB",
+                                "min": 0,
+                                "max": round(total_gb, 1),
+                                "pct": max(0.0, min(1.0, used_gb / total_gb)),
+                                "icon": "database",
+                                "default_color": "blue",
+                            }
+                            results[f"{gpu_slug}/vram_free"] = {
+                                "id": f"{gpu_slug}/vram_free",
+                                "category": cat,
+                                "name": f"{name} - VRAM Free (GB)",
+                                "short_label": "VFREE",
+                                "value": round(free_gb, 2),
+                                "val_text": f"{free_gb:.1f} GB",
+                                "unit": "GB",
+                                "min": 0,
+                                "max": round(total_gb, 1),
+                                "pct": max(0.0, min(1.0, free_gb / total_gb)),
+                                "icon": "database",
+                                "default_color": "green",
+                            }
+                        if mclk > 0:
+                            results[f"{gpu_slug}/mem_clock"] = {
+                                "id": f"{gpu_slug}/mem_clock",
+                                "category": cat,
+                                "name": f"{name} - Memory Clock",
+                                "short_label": "MCLK",
+                                "value": round(mclk, 0),
+                                "val_text": f"{mclk:.0f} MHz",
+                                "unit": "MHz",
+                                "min": 0,
+                                "max": 10000,
+                                "pct": max(0.0, min(1.0, mclk / 10000.0)),
+                                "icon": "bolt",
+                                "default_color": "purple",
+                            }
+                        if temp > 0:
+                            results[f"{gpu_slug}/temp"] = {
+                                "id": f"{gpu_slug}/temp",
+                                "category": cat,
+                                "name": f"{name} - Temperature",
+                                "short_label": "GTEMP",
+                                "value": round(temp, 1),
+                                "val_text": f"{temp:.0f}°C",
+                                "unit": "°C",
+                                "min": 0,
+                                "max": 105,
+                                "pct": max(0.0, min(1.0, temp / 105.0)),
+                                "icon": "flame",
+                                "default_color": "orange",
+                            }
+                        if power > 0:
+                            results[f"{gpu_slug}/power"] = {
+                                "id": f"{gpu_slug}/power",
+                                "category": cat,
+                                "name": f"{name} - Power Draw",
+                                "short_label": "GPWR",
+                                "value": round(power, 1),
+                                "val_text": f"{power:.1f} W",
+                                "unit": "W",
+                                "min": 0,
+                                "max": 250,
+                                "pct": max(0.0, min(1.0, power / 250.0)),
+                                "icon": "bolt",
+                                "default_color": "yellow",
+                            }
+            else:
+                _NVIDIA_SMI_AVAILABLE = False
+        except FileNotFoundError:
+            _NVIDIA_SMI_AVAILABLE = False
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    if not has_gpus:
+        card_dirs = sorted(glob.glob("/sys/class/drm/card[0-9]"))
+        for card in card_dirs:
+            card_name = os.path.basename(card)
+            load_path = os.path.join(card, "device", "gpu_busy_percent")
+            if os.path.exists(load_path):
+                txt = read_text(load_path)
+                if txt.isdigit():
+                    pct = float(txt)
+                    results[f"gpu/{card_name}/load"] = {
+                        "id": f"gpu/{card_name}/load",
+                        "category": "GPU",
+                        "name": f"DRM {card_name} GPU Load",
+                        "short_label": "GPU",
+                        "value": round(pct, 1),
+                        "val_text": f"{pct:.0f}%",
+                        "unit": "%",
+                        "min": 0,
+                        "max": 100,
+                        "pct": max(0.0, min(1.0, pct / 100.0)),
+                        "icon": "device-gamepad",
+                        "default_color": "green",
+                    }
+
+    return results
+
+
+def sample_hwmon() -> Dict[str, Dict[str, Any]]:
+    results = {}
+    hwmon_dirs = sorted(glob.glob("/sys/class/hwmon/hwmon*"))
+
+    for hdir in hwmon_dirs:
+        hname = read_text(os.path.join(hdir, "name"), os.path.basename(hdir))
+
+        chip_label = hname
+        if hname == "k10temp":
+            chip_label = "AMD Ryzen Thermal"
+        elif hname == "coretemp":
+            chip_label = "Intel CPU Thermal"
+        elif hname == "zenpower":
+            chip_label = "AMD Zen Thermal"
+        elif hname == "asus":
+            chip_label = "ASUS Hardware"
+        elif hname == "amdgpu":
+            chip_label = "AMD Radeon GPU"
+        elif hname == "nouveau":
+            chip_label = "NVIDIA Nouveau GPU"
+        elif hname.startswith("nvme"):
+            chip_label = f"NVMe SSD ({hname})"
+
+        for temp_input in sorted(glob.glob(os.path.join(hdir, "temp*_input"))):
+            idx = re.search(r"temp(\d+)_input", temp_input)
+            if not idx:
                 continue
-            vendor = read_text(os.path.join(card_path, "device/vendor")).lower()
-            runtime_status = read_text(os.path.join(card_path, "power/runtime_status"), "active")
-            gt_cur = read_float(os.path.join(card_path, "gt_cur_freq_mhz")) or read_float(
-                os.path.join(card_path, "gt/gt0/rps_cur_freq_mhz")
-            )
-            gt_max = read_float(os.path.join(card_path, "gt_max_freq_mhz")) or read_float(
-                os.path.join(card_path, "gt/gt0/rps_max_freq_mhz")
-            )
-            busy_pct = read_float(os.path.join(card_path, "device/gpu_busy_percent"))
-            drm_cards.append(
-                {
-                    "card": base,
-                    "vendor": vendor,
-                    "runtime_status": runtime_status,
-                    "gt_cur_mhz": gt_cur,
-                    "gt_max_mhz": gt_max,
-                    "busy_pct": busy_pct,
+            num = idx.group(1)
+            try:
+                deg_c = int(read_text(temp_input)) / 1000.0
+            except (ValueError, TypeError):
+                continue
+            if not (-40 <= deg_c <= 150):
+                continue
+
+            lbl = read_text(os.path.join(hdir, f"temp{num}_label"), f"Temp {num}")
+            sensor_id = f"hwmon/{hname}/temp{num}"
+
+            full_name = f"{chip_label} - {lbl}"
+            if lbl == "Tctl":
+                full_name = "CPU Package Temperature (Tctl)"
+                results["cpu/package_temp"] = {
+                    "id": "cpu/package_temp",
+                    "category": "CPU",
+                    "name": "CPU Package Temperature",
+                    "short_label": "TEMP",
+                    "value": round(deg_c, 1),
+                    "val_text": f"{deg_c:.0f}°C",
+                    "unit": "°C",
+                    "min": 0,
+                    "max": 105,
+                    "pct": max(0.0, min(1.0, deg_c / 105.0)),
+                    "icon": "flame",
+                    "default_color": "orange",
                 }
-            )
 
-        is_multi_gpu = len(nvtop_gpus) > 1 or len(drm_cards) > 1
-        for idx, g in enumerate(nvtop_gpus):
-            if not isinstance(g, dict):
+            results[sensor_id] = {
+                "id": sensor_id,
+                "category": "Thermals",
+                "name": full_name,
+                "short_label": "TEMP",
+                "value": round(deg_c, 1),
+                "val_text": f"{deg_c:.0f}°C",
+                "unit": "°C",
+                "min": 0,
+                "max": 105,
+                "pct": max(0.0, min(1.0, deg_c / 105.0)),
+                "icon": "flame",
+                "default_color": "orange",
+            }
+
+        for fan_input in sorted(glob.glob(os.path.join(hdir, "fan*_input"))):
+            idx = re.search(r"fan(\d+)_input", fan_input)
+            if not idx:
                 continue
-            dev_name = str(g.get("device_name") or f"GPU {idx}")
-            short_tag = f"GPU{idx}"
-            if "nvidia" in dev_name.lower() or "rtx" in dev_name.lower() or "gtx" in dev_name.lower():
-                short_tag = "dGPU" if is_multi_gpu else "GPU"
-            elif "intel" in dev_name.lower() or "uhd" in dev_name.lower() or "iris" in dev_name.lower():
-                short_tag = "iGPU" if is_multi_gpu else "GPU"
-            elif "amd" in dev_name.lower() or "radeon" in dev_name.lower():
-                short_tag = f"GPU{idx}" if is_multi_gpu else "GPU"
-
-            util_str = str(g.get("gpu_util") or "0%").replace("%", "").strip()
-            util_pct = float(util_str) if util_str.replace(".", "", 1).isdigit() else 0.0
-            temp_str = str(g.get("temp") or "")
-            power_str = str(g.get("power_draw") or "")
-            clock_str = str(g.get("gpu_clock") or "")
-
-            sub = temp_str if temp_str and temp_str != "None" else (clock_str if clock_str and clock_str != "None" else short_tag)
-
-            self.register(
-                sensor_id=f"gpu/gpu{idx}/usage",
-                category=f"GPU {idx}: {dev_name}",
-                name=f"{dev_name} Load",
-                short_label=short_tag,
-                value=util_pct,
-                unit="%",
-                val_text=f"{util_pct:.0f}%",
-                sub_text=sub,
-                percent=util_pct,
-                icon="device-desktop",
-                default_color="blue" if idx == 0 else "cyan",
-            )
-
-            # VRAM (or Shared iGPU Graphics Memory via DRM fdinfo / GEM Shmem)
-            mem_used = g.get("mem_used")
-            mem_total = g.get("mem_total")
-            if mem_used is None or mem_total is None:
-                proc_sum = 0.0
-                for p in g.get("processes", []) or []:
-                    if isinstance(p, dict) and p.get("gpu_mem_bytes_alloc") is not None:
-                        try:
-                            proc_sum += float(p["gpu_mem_bytes_alloc"])
-                        except (ValueError, TypeError):
-                            pass
-                if proc_sum <= 0:
-                    proc_sum = float(getattr(self, "_shmem_bytes", 0))
-                sys_ram = float(getattr(self, "_mem_total_bytes", 16 * 1024 ** 3))
-                mem_used = proc_sum
-                mem_total = max(4.0 * 1024 ** 3, sys_ram * 0.5)
-
-            if mem_used is not None and mem_total is not None:
-                try:
-                    u_b = float(mem_used)
-                    t_b = float(mem_total)
-                    if t_b > 0:
-                        f_b = max(0.0, t_b - u_b)
-                        vram_pct = u_b / t_b * 100.0
-                        vram_label = "VRAM" if short_tag in ("GPU", "dGPU") else f"{short_tag}M"
-                        self.register(
-                            sensor_id=f"gpu/gpu{idx}/usedVramPct",
-                            category=f"GPU {idx}: {dev_name}",
-                            name=f"{dev_name} Memory",
-                            short_label=vram_label,
-                            value=vram_pct,
-                            unit="%",
-                            val_text=format_bytes(u_b),
-                            sub_text=f"+{format_bytes(f_b)}",
-                            percent=vram_pct,
-                            icon="cpu-2",
-                            default_color="blue" if idx == 0 else "cyan",
-                        )
-                except (ValueError, TypeError):
-                    pass
-
-            # Temperature
-            if temp_str and temp_str != "None":
-                m_t = re.search(r"(\d+)", temp_str)
-                if m_t:
-                    t_val = float(m_t.group(1))
-                    self.register(
-                        sensor_id=f"gpu/gpu{idx}/temperature",
-                        category=f"GPU {idx}: {dev_name}",
-                        name=f"{dev_name} Temperature",
-                        short_label=f"{short_tag}T",
-                        value=t_val,
-                        unit="°C",
-                        val_text=f"{t_val:.0f}°C",
-                        sub_text=power_str if power_str and power_str != "None" else short_tag,
-                        min_val=25.0,
-                        max_val=95.0,
-                        icon="temperature",
-                        default_color="orange",
-                    )
-
-            # Power
-            if power_str and power_str != "None":
-                m_p = re.search(r"(\d+(?:\.\d+)?)", power_str)
-                if m_p:
-                    p_val = float(m_p.group(1))
-                    self.register(
-                        sensor_id=f"gpu/gpu{idx}/power",
-                        category=f"GPU {idx}: {dev_name}",
-                        name=f"{dev_name} Power Draw",
-                        short_label=f"{short_tag}W",
-                        value=p_val,
-                        unit="W",
-                        val_text=f"{p_val:.0f}W",
-                        sub_text=clock_str if clock_str and clock_str != "None" else short_tag,
-                        min_val=0.0,
-                        max_val=140.0,
-                        icon="bolt",
-                        default_color="yellow",
-                    )
-
-        # Supplement with DRM sysfs cards (e.g. Intel GT frequency or when inside sandbox)
-        has_intel_in_nvtop = any(
-            "intel" in str(g.get("device_name", "")).lower() or "uhd" in str(g.get("device_name", "")).lower()
-            for g in nvtop_gpus
-        )
-        for dc in drm_cards:
-            card_name = dc["card"]
-            if dc["vendor"] == "0x8086" and dc["gt_cur_mhz"] is not None:
-                cur_mhz = dc["gt_cur_mhz"]
-                max_mhz = dc["gt_max_mhz"] or 1450.0
-                pct = max(0.0, min(100.0, cur_mhz / max_mhz * 100.0))
-                if not has_intel_in_nvtop:
-                    idx = len(nvtop_gpus)
-                    self.register(
-                        sensor_id=f"gpu/gpu{idx}/usage",
-                        category=f"GPU {idx}: Intel Integrated Graphics ({card_name})",
-                        name="Intel iGPU Activity / Clock",
-                        short_label="iGPU",
-                        value=pct,
-                        unit="%",
-                        val_text=f"{pct:.0f}%",
-                        sub_text=f"{cur_mhz:.0f}MHz",
-                        percent=pct,
-                        icon="device-desktop",
-                        default_color="cyan",
-                    )
-                    u_b = float(getattr(self, "_shmem_bytes", 0))
-                    t_b = max(4.0 * 1024 ** 3, float(getattr(self, "_mem_total_bytes", 16 * 1024 ** 3)) * 0.5)
-                    f_b = max(0.0, t_b - u_b)
-                    igpu_mem_pct = u_b / t_b * 100.0
-                    self.register(
-                        sensor_id=f"gpu/gpu{idx}/usedVramPct",
-                        category=f"GPU {idx}: Intel Integrated Graphics ({card_name})",
-                        name="Intel iGPU Shared Memory (GEM/Shmem)",
-                        short_label="iGPUM",
-                        value=igpu_mem_pct,
-                        unit="%",
-                        val_text=format_bytes(u_b),
-                        sub_text=f"+{format_bytes(f_b)}",
-                        percent=igpu_mem_pct,
-                        icon="cpu-2",
-                        default_color="cyan",
-                    )
-                self.register(
-                    sensor_id=f"gpu/{card_name}/gtFrequency",
-                    category=f"DRM GPU ({card_name})",
-                    name=f"Intel iGPU GT Frequency ({card_name})",
-                    short_label="iCLK",
-                    value=cur_mhz,
-                    unit="MHz",
-                    val_text=f"{cur_mhz:.0f}M",
-                    sub_text=f"max {max_mhz:.0f}M",
-                    min_val=0.0,
-                    max_val=max_mhz,
-                    icon="bolt",
-                    default_color="cyan",
-                )
-
-    def _collect_disks(self) -> None:
-        # Root filesystem usage
-        try:
-            st = os.statvfs("/")
-            total = st.f_blocks * st.f_frsize
-            free = st.f_bavail * st.f_frsize
-            if total > 0:
-                used = max(0, total - free)
-                pct = used / total * 100.0
-                self.register(
-                    sensor_id="disk/root/usedPercent",
-                    category="Disks & Storage",
-                    name="Root Filesystem (/) Usage",
-                    short_label="DISK",
-                    value=pct,
-                    unit="%",
-                    val_text=format_bytes(used),
-                    sub_text=f"+{format_bytes(free)}",
-                    percent=pct,
-                    icon="database",
-                    default_color="green",
-                )
-        except OSError:
-            pass
-
-        # Block device I/O rates from /proc/diskstats
-        prev_io = self.prev_state.get("disk_io", {})
-        cur_io: Dict[str, Tuple[int, int]] = {}
-        block_devs = {
-            os.path.basename(p)
-            for p in glob.glob("/sys/block/*")
-            if not os.path.basename(p).startswith(("loop", "ram", "zram", "dm-"))
-        }
-        try:
-            with open("/proc/diskstats", "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.split()
-                    if len(parts) < 14:
-                        continue
-                    dev = parts[2]
-                    if dev not in block_devs:
-                        continue
-                    r_bytes = int(parts[5]) * 512
-                    w_bytes = int(parts[9]) * 512
-                    cur_io[dev] = (r_bytes, w_bytes)
-                    if dev in prev_io:
-                        pr, pw = prev_io[dev]
-                        r_rate = max(0.0, (r_bytes - pr) / self.dt)
-                        w_rate = max(0.0, (w_bytes - pw) / self.dt)
-                    else:
-                        r_rate, w_rate = 0.0, 0.0
-
-                    self.register(
-                        sensor_id=f"disk/{dev}/read",
-                        category="Disks & Storage",
-                        name=f"Disk {dev} Read Speed",
-                        short_label="DSKR",
-                        value=r_rate / (1024 ** 2),
-                        unit="MB/s",
-                        val_text=format_rate(r_rate),
-                        sub_text=dev,
-                        min_val=0.0,
-                        max_val=500.0,
-                        icon="arrow-down",
-                        default_color="green",
-                    )
-                    self.register(
-                        sensor_id=f"disk/{dev}/write",
-                        category="Disks & Storage",
-                        name=f"Disk {dev} Write Speed",
-                        short_label="DSKW",
-                        value=w_rate / (1024 ** 2),
-                        unit="MB/s",
-                        val_text=format_rate(w_rate),
-                        sub_text=dev,
-                        min_val=0.0,
-                        max_val=500.0,
-                        icon="arrow-up",
-                        default_color="orange",
-                    )
-        except OSError:
-            pass
-        self.new_state["disk_io"] = cur_io
-
-    def _collect_network(self) -> None:
-        prev_net = self.prev_state.get("net_io", {})
-        cur_net: Dict[str, Tuple[int, int]] = {}
-        total_rx = 0.0
-        total_tx = 0.0
-
-        try:
-            with open("/proc/net/dev", "r", encoding="utf-8") as f:
-                for line in f:
-                    if ":" not in line:
-                        continue
-                    iface, rest = line.split(":", 1)
-                    iface = iface.strip()
-                    if iface == "lo" or iface.startswith(("veth", "docker", "br-", "virbr")):
-                        continue
-                    fields = rest.split()
-                    if len(fields) < 10:
-                        continue
-                    rx_b = int(fields[0])
-                    tx_b = int(fields[8])
-                    cur_net[iface] = (rx_b, tx_b)
-                    if iface in prev_net:
-                        prx, ptx = prev_net[iface]
-                        rx_rate = max(0.0, (rx_b - prx) / self.dt)
-                        tx_rate = max(0.0, (tx_b - ptx) / self.dt)
-                    else:
-                        rx_rate, tx_rate = 0.0, 0.0
-
-                    total_rx += rx_rate
-                    total_tx += tx_rate
-
-                    self.register(
-                        sensor_id=f"network/{iface}/download",
-                        category="Network Interfaces",
-                        name=f"{iface} Download Rate",
-                        short_label="NET↓",
-                        value=rx_rate / (1024 ** 2),
-                        unit="MB/s",
-                        val_text=format_rate(rx_rate),
-                        sub_text=iface,
-                        min_val=0.0,
-                        max_val=50.0,
-                        icon="arrow-down",
-                        default_color="cyan",
-                    )
-                    self.register(
-                        sensor_id=f"network/{iface}/upload",
-                        category="Network Interfaces",
-                        name=f"{iface} Upload Rate",
-                        short_label="NET↑",
-                        value=tx_rate / (1024 ** 2),
-                        unit="MB/s",
-                        val_text=format_rate(tx_rate),
-                        sub_text=iface,
-                        min_val=0.0,
-                        max_val=50.0,
-                        icon="arrow-up",
-                        default_color="purple",
-                    )
-        except OSError:
-            pass
-
-        self.new_state["net_io"] = cur_net
-        self.register(
-            sensor_id="network/all/download",
-            category="Network Interfaces",
-            name="Total Network Download",
-            short_label="DOWN",
-            value=total_rx / (1024 ** 2),
-            unit="MB/s",
-            val_text=format_rate(total_rx),
-            sub_text=f"↑{format_rate(total_tx)}",
-            min_val=0.0,
-            max_val=50.0,
-            icon="arrow-down",
-            default_color="cyan",
-        )
-        self.register(
-            sensor_id="network/all/upload",
-            category="Network Interfaces",
-            name="Total Network Upload",
-            short_label="UP",
-            value=total_tx / (1024 ** 2),
-            unit="MB/s",
-            val_text=format_rate(total_tx),
-            sub_text=f"↓{format_rate(total_rx)}",
-            min_val=0.0,
-            max_val=50.0,
-            icon="arrow-up",
-            default_color="purple",
-        )
-
-    def _collect_power(self) -> None:
-        for psy in sorted(glob.glob("/sys/class/power_supply/*")):
-            pname = os.path.basename(psy)
-            ptype = read_text(os.path.join(psy, "type"))
-            if ptype.lower() == "battery":
-                cap = read_float(os.path.join(psy, "capacity"))
-                status = read_text(os.path.join(psy, "status"), "Unknown")
-                if cap is not None:
-                    self.register(
-                        sensor_id=f"power/{pname}/chargePercent",
-                        category="Power & Voltage",
-                        name=f"Battery {pname} Charge",
-                        short_label="BAT",
-                        value=cap,
-                        unit="%",
-                        val_text=f"{cap:.0f}%",
-                        sub_text=status,
-                        percent=cap,
-                        icon="battery",
-                        default_color="green",
-                    )
-
-    def _collect_pressure(self) -> None:
-        for res in ("cpu", "memory", "io"):
-            pfile = f"/proc/pressure/{res}"
-            txt = read_text(pfile)
-            if not txt:
+            num = idx.group(1)
+            try:
+                rpm = int(read_text(fan_input))
+            except (ValueError, TypeError):
                 continue
-            for line in txt.splitlines():
-                if line.startswith("some "):
-                    m = re.search(r"avg10=(\d+(?:\.\d+)?)", line)
-                    if m:
-                        val = float(m.group(1))
-                        self.register(
-                            sensor_id=f"pressure/{res}/some10",
-                            category="Linux PSI Pressure",
-                            name=f"{res.upper()} Pressure (10s avg)",
-                            short_label=f"PSI-{res[0].upper()}",
-                            value=val,
-                            unit="%",
-                            val_text=f"{val:.1f}%",
-                            sub_text="10s stall",
-                            percent=val,
-                            icon="activity",
-                            default_color="red" if val > 10 else "yellow",
-                        )
+            if rpm < 0 or rpm > 20000:
+                continue
+            lbl = read_text(os.path.join(hdir, f"fan{num}_label"), f"Fan {num}")
+            sensor_id = f"hwmon/{hname}/fan{num}"
+            results[sensor_id] = {
+                "id": sensor_id,
+                "category": "Fans & Cooling",
+                "name": f"{chip_label} - {lbl}",
+                "short_label": "FAN",
+                "value": rpm,
+                "val_text": f"{rpm} RPM",
+                "unit": "RPM",
+                "min": 0,
+                "max": 6000,
+                "pct": max(0.0, min(1.0, rpm / 6000.0)),
+                "icon": "car-fan",
+                "default_color": "cyan",
+            }
+
+        for pwr_input in sorted(glob.glob(os.path.join(hdir, "power*_input"))):
+            idx = re.search(r"power(\d+)_input", pwr_input)
+            if not idx:
+                continue
+            num = idx.group(1)
+            try:
+                watts = int(read_text(pwr_input)) / 1000000.0
+            except (ValueError, TypeError):
+                continue
+            if watts < 0 or watts > 2000:
+                continue
+            lbl = read_text(os.path.join(hdir, f"power{num}_label"), f"Power {num}")
+            sensor_id = f"hwmon/{hname}/power{num}"
+            results[sensor_id] = {
+                "id": sensor_id,
+                "category": "Power & Battery",
+                "name": f"{chip_label} - {lbl} Draw",
+                "short_label": "PWR",
+                "value": round(watts, 1),
+                "val_text": f"{watts:.1f} W",
+                "unit": "W",
+                "min": 0,
+                "max": 250,
+                "pct": max(0.0, min(1.0, watts / 250.0)),
+                "icon": "bolt",
+                "default_color": "yellow",
+            }
+
+    return results
 
 
-# ---------------------------------------------------------------------------
-# 3x Supersampled Pillow Renderer: Ring, Bar, and Histogram
-# ---------------------------------------------------------------------------
-def _draw_capsule_arc(
-    draw: Any,
-    center: Tuple[float, float],
-    radius: float,
-    thickness: float,
-    start_angle: float,
-    end_angle: float,
-    fill: Tuple[int, int, int, int],
-) -> None:
-    cx, cy = center
-    mid_r = radius - thickness / 2.0
-    cap_r = thickness / 2.0
-    bbox = [cx - radius, cy - radius, cx + radius, cy + radius]
-    draw.arc(bbox, start=start_angle, end=end_angle, fill=fill, width=int(thickness))
-    for angle in (start_angle, end_angle):
-        rad = math.radians(angle)
-        cap_x = cx + mid_r * math.cos(rad)
-        cap_y = cy + mid_r * math.sin(rad)
-        draw.ellipse([cap_x - cap_r, cap_y - cap_r, cap_x + cap_r, cap_y + cap_r], fill=fill)
-
-
-def render_sensor_graph(
-    sensor: Dict[str, Any],
-    graph_type: str,
-    color_name: str,
-    skin_name: str,
-    target_px: int,
-    compact: bool,
-    out_path: str,
-) -> bool:
-    if not HAS_PIL:
-        return False
-
-    skin = SKINS.get(skin_name, SKINS["dark"])
-    rgb = PALETTE_COLORS.get(color_name, PALETTE_COLORS.get(sensor.get("default_color", "blue"), (120, 180, 255)))
-    percent = float(sensor.get("percent", 0.0))
-    val_text = str(sensor.get("val_text", ""))
-    label_text = str(sensor.get("short_label", ""))
-    sub_text = str(sensor.get("sub_text", ""))
-    history = sensor.get("history", [percent])
-
-    scale = 3
-    if graph_type == "ring":
-        w_out = max(24, int(target_px))
-        h_out = w_out
-        w, h = w_out * scale, h_out * scale
-        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        cx, cy = w / 2.0, h / 2.0
-        radius = (w / 2.0) - (3 * scale if compact else 7 * scale)
-        thickness = max(3 * scale, radius * (0.24 if compact else 0.165))
-
-        halo_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        halo_draw = ImageDraw.Draw(halo_layer)
-        draw = ImageDraw.Draw(img)
-
-        # Fill inner gauge face with subtle dark/light disc so text has high contrast on any wallpaper
-        inner_r = radius - thickness * 0.5
-        draw.ellipse(
-            [cx - inner_r, cy - inner_r, cx + inner_r, cy + inner_r],
-            fill=skin["bg_card"],
-        )
-
-        draw.ellipse(
-            [cx - radius, cy - radius, cx + radius, cy + radius],
-            outline=skin["track"],
-            width=int(thickness),
-        )
-
-        if percent > 0.2:
-            start_deg = -90.0
-            span = max(360.0 * min(percent, 100.0) / 100.0, 14.0)
-            end_deg = start_deg + span
-
-            if not compact:
-                _draw_capsule_arc(
-                    halo_draw,
-                    (cx, cy),
-                    radius + 4 * scale,
-                    thickness + 8 * scale,
-                    start_deg,
-                    end_deg,
-                    rgb + (68,),
-                )
-                img = Image.alpha_composite(img, halo_layer)
-                draw = ImageDraw.Draw(img)
-
-            _draw_capsule_arc(
-                draw,
-                (cx, cy),
-                radius,
-                thickness,
-                start_deg,
-                end_deg,
-                rgb + (255,),
-            )
-
-        if compact and w_out < 52:
-            # Compact ring for standard top bars: crisp single centered value scaled to character count
-            short_val = val_text.replace("/s", "")
-            n_chars = len(short_val)
-            ratio = 0.26 if n_chars <= 3 else (0.205 if n_chars == 4 else 0.175)
-            f_val = get_font(max(8 * scale, int(w_out * ratio * scale)), bold=True)
-            draw.text((cx, cy), short_val, font=f_val, fill=skin["text"], anchor="mm")
-        else:
-            # Full 3-line NVTOP/KDE tachometer inside the ring
-            n_chars = len(val_text)
-            val_ratio = 0.175 if n_chars <= 4 else (0.15 if n_chars <= 6 else 0.13)
-            f_val = get_font(max(10 * scale, int(w_out * val_ratio * scale)), bold=True)
-            f_lbl = get_font(max(9 * scale, int(w_out * 0.13 * scale)), bold=True)
-            f_sub = get_font(max(8 * scale, int(w_out * 0.11 * scale)), bold=False)
-            draw.text((cx, cy - w * 0.13), val_text, font=f_val, fill=skin["text"], anchor="mm")
-            draw.text((cx, cy + w * 0.04), label_text, font=f_lbl, fill=rgb + (255,), anchor="mm")
-            if sub_text:
-                draw.text((cx, cy + w * 0.19), sub_text, font=f_sub, fill=skin["subtext"], anchor="mm")
-
-    elif graph_type == "bar":
-        if compact:
-            w_out = max(44, int(target_px * 1.5))
-            h_out = max(14, int(target_px * 0.42))
-        else:
-            w_out = max(96, int(target_px * 1.15))
-            h_out = max(28, int(target_px * 0.34))
-        w, h = w_out * scale, h_out * scale
-        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        pad = 2 * scale
-        r = (h - 2 * pad) / 2.0
-        draw.rounded_rectangle([pad, pad, w - pad, h - pad], radius=r, fill=skin["track"])
-        fill_w = max(2 * r, (w - 2 * pad) * (min(100.0, max(0.0, percent)) / 100.0))
-        if percent > 0.5:
-            draw.rounded_rectangle([pad, pad, pad + fill_w, h - pad], radius=r, fill=rgb + (220,))
-        if not compact:
-            bar_str = f"{label_text} {val_text}"
-            ratio = 0.34 if len(bar_str) <= 9 else 0.28
-            f_txt = get_font(max(9 * scale, int(h_out * ratio * scale)), bold=True)
-            draw.text(
-                (w / 2.0, h / 2.0),
-                bar_str,
-                font=f_txt,
-                fill=skin["text"],
-                anchor="mm",
-                stroke_width=max(1, scale // 2),
-                stroke_fill=skin["bg_card"],
-            )
-
-    else:  # histogram (rolling sparkline/area graph)
-        if compact:
-            w_out = max(48, int(target_px * 1.55))
-            h_out = max(20, int(target_px * 0.72))
-        else:
-            w_out = max(100, int(target_px * 1.15))
-            h_out = max(56, int(target_px * 0.68))
-        w, h = w_out * scale, h_out * scale
-        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        pad = 2 * scale
-        r = 6 * scale
-        draw.rounded_rectangle([pad, pad, w - pad, h - pad], radius=r, fill=skin["bg_card"], outline=skin["track"], width=scale)
-
-        pts = list(history[-30:]) if history else [percent]
-        while len(pts) < 30:
-            pts.insert(0, pts[0] if pts else 0.0)
-
-        inner_w = w - 4 * pad
-        inner_h = h - 4 * pad
-        step_x = inner_w / max(1, len(pts) - 1)
-        poly = [(2 * pad, h - 2 * pad)]
-        line_pts = []
-        for i, p in enumerate(pts):
-            px = 2 * pad + i * step_x
-            py = (h - 2 * pad) - (max(0.0, min(100.0, float(p))) / 100.0) * inner_h
-            poly.append((px, py))
-            line_pts.append((px, py))
-        poly.append((2 * pad + inner_w, h - 2 * pad))
-
-        area_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-        area_draw = ImageDraw.Draw(area_layer)
-        area_draw.polygon(poly, fill=rgb + (90,))
-        img = Image.alpha_composite(img, area_layer)
-        draw = ImageDraw.Draw(img)
-        if len(line_pts) >= 2:
-            draw.line(line_pts, fill=rgb + (255,), width=2 * scale, joint="curve")
-
-        if not compact:
-            f_lbl = get_font(int(h_out * 0.22 * scale), bold=True)
-            draw.text((4 * pad, 3 * pad), f"{label_text} {val_text}", font=f_lbl, fill=skin["text"], anchor="lt")
-
-    final_img = img.resize((w_out, h_out), Image.Resampling.LANCZOS)
-    try:
-        tmp_path = out_path + ".tmp"
-        final_img.save(tmp_path, "PNG")
-        os.replace(tmp_path, out_path)
-        return True
-    except OSError:
-        return False
-
-
-def build_default_active_list(sensors: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Hardware-agnostic starter sensor list based on whatever hardware exists on the host."""
-    defaults: List[Dict[str, Any]] = []
-
-    def add_if_exists(sid: str, graph_type: str = "ring", color: str = "blue", on_bar: bool = True) -> None:
-        if sid in sensors:
-            s = sensors[sid]
-            defaults.append(
-                {
-                    "id": sid,
-                    "label": s["short_label"],
-                    "graph_type": graph_type,
-                    "color": color,
-                    "show_icon": False,
-                    "show_label": True,
-                    "show_value": True,
-                    "show_graph": True,
-                    "on_bar": on_bar,
-                    "on_desktop": True,
-                }
-            )
-
-    add_if_exists("cpu/all/usage", "ring", "blue", True)
-    add_if_exists("memory/physical/usedPercent", "ring", "purple", True)
-
-    # Add every discovered GPU's Load and VRAM automatically!
-    gpu_ids = sorted([k for k in sensors.keys() if re.match(r"^gpu/gpu\d+/usage$", k)])
-    for idx, gid in enumerate(gpu_ids):
-        col = "blue" if idx == 0 else "cyan"
-        add_if_exists(gid, "ring", col, True)
-        vram_id = gid.replace("/usage", "/usedVramPct")
-        add_if_exists(vram_id, "ring", col, True)
-
-    # Add first 2 hardware fans if available (e.g. CPU/GPU fans) on desktop by default
-    fan_ids = sorted([k for k in sensors.keys() if "/fan" in k])[:2]
-    for fid in fan_ids:
-        add_if_exists(fid, "bar", "green", False)
-
-    return defaults
-
-
-def main() -> None:
-    os.makedirs(RUNTIME_BASE, exist_ok=True)
-
-    prev_state: Dict[str, Any] = {}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                prev_state = json.load(f)
-        except Exception:
-            prev_state = {}
-
-    cfg: Dict[str, Any] = {}
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
-
-    theme = str(sys.argv[1] if len(sys.argv) > 1 else cfg.get("theme", "dark"))
-    bar_size = int(sys.argv[2] if len(sys.argv) > 2 else cfg.get("bar_size", 34))
-    desktop_size = int(sys.argv[3] if len(sys.argv) > 3 else cfg.get("desktop_size", 96))
-    respect_gpu_sleep = (
-        sys.argv[4].lower() == "true"
-        if len(sys.argv) > 4
-        else bool(cfg.get("respect_gpu_sleep", False))
-    )
-    sensors_json_path = sys.argv[5] if len(sys.argv) > 5 else ""
-
-    engine = KdeStyleSensorEngine(prev_state, respect_gpu_sleep=respect_gpu_sleep)
-    sensors = engine.collect_all()
+def sample_network() -> Dict[str, Dict[str, Any]]:
+    global _PREV_NET_BYTES
+    results = {}
+    now = time.time()
 
     try:
-        with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(engine.new_state, f)
-        os.replace(STATE_FILE + ".tmp", STATE_FILE)
+        with open("/proc/net/dev", "r", encoding="utf-8") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                parts = line.split(":")
+                iface = parts[0].strip()
+                if iface in {"lo"} or iface.startswith(("docker", "veth", "br-", "virbr")):
+                    continue
+
+                vals = parts[1].split()
+                rx_bytes = int(vals[0])
+                tx_bytes = int(vals[8])
+
+                prev_rx, prev_tx, prev_time = _PREV_NET_BYTES.get(iface, (rx_bytes, tx_bytes, now))
+                _PREV_NET_BYTES[iface] = (rx_bytes, tx_bytes, now)
+
+                dt = max(0.1, now - prev_time)
+                rx_rate = max(0.0, (rx_bytes - prev_rx) / dt)
+                tx_rate = max(0.0, (tx_bytes - prev_tx) / dt)
+
+                human_name = f"Wi-Fi ({iface})" if iface.startswith("wl") else f"Ethernet ({iface})"
+                icon = "wifi" if iface.startswith("wl") else "network"
+
+                id_rx = f"net/{iface}/rx_rate"
+                rx_mb = rx_rate / (1024 * 1024)
+                results[id_rx] = {
+                    "id": id_rx,
+                    "category": "Network",
+                    "name": f"{human_name} - Download Speed",
+                    "short_label": "DL",
+                    "value": round(rx_mb, 2),
+                    "val_text": format_rate_human(rx_rate),
+                    "unit": "rate",
+                    "min": 0,
+                    "max": 25.0,
+                    "pct": min(1.0, rx_mb / 25.0),
+                    "icon": icon,
+                    "default_color": "blue",
+                }
+
+                id_tx = f"net/{iface}/tx_rate"
+                tx_mb = tx_rate / (1024 * 1024)
+                results[id_tx] = {
+                    "id": id_tx,
+                    "category": "Network",
+                    "name": f"{human_name} - Upload Speed",
+                    "short_label": "UL",
+                    "value": round(tx_mb, 2),
+                    "val_text": format_rate_human(tx_rate),
+                    "unit": "rate",
+                    "min": 0,
+                    "max": 10.0,
+                    "pct": min(1.0, tx_mb / 10.0),
+                    "icon": icon,
+                    "default_color": "orange",
+                }
     except OSError:
         pass
 
-    active_cfg = None
-    if sensors_json_path and os.path.exists(sensors_json_path):
+    return results
+
+
+def sample_battery() -> Dict[str, Dict[str, Any]]:
+    results = {}
+    for pdir in glob.glob("/sys/class/power_supply/*"):
+        pname = os.path.basename(pdir)
+        ptype = read_text(os.path.join(pdir, "type"))
+        if ptype != "Battery":
+            continue
+
+        cap_txt = read_text(os.path.join(pdir, "capacity"))
+        if cap_txt.isdigit():
+            cap = int(cap_txt)
+            status = read_text(os.path.join(pdir, "status"), "Discharging")
+            id_bat = f"battery/{pname}/capacity"
+            results[id_bat] = {
+                "id": id_bat,
+                "category": "Power & Battery",
+                "name": f"Battery {pname} Charge ({status})",
+                "short_label": "BAT",
+                "value": cap,
+                "val_text": f"{cap}%",
+                "unit": "%",
+                "min": 0,
+                "max": 100,
+                "pct": cap / 100.0,
+                "icon": "battery-charging" if status == "Charging" else "battery",
+                "default_color": "green" if cap > 25 else "red",
+            }
+    return results
+
+
+def sample_psi() -> Dict[str, Dict[str, Any]]:
+    results = {}
+    for res in ["cpu", "memory", "io"]:
+        path = f"/proc/pressure/{res}"
+        if not os.path.exists(path):
+            continue
         try:
-            with open(sensors_json_path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, list) and len(loaded) > 0:
-                    active_cfg = loaded
-        except Exception:
-            active_cfg = None
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("some"):
+                        m = re.search(r"avg10=([\d\.]+)", line)
+                        if m:
+                            val = float(m.group(1))
+                            id_psi = f"psi/{res}/stall"
+                            results[id_psi] = {
+                                "id": id_psi,
+                                "category": "Linux PSI Pressure",
+                                "name": f"Linux PSI: {res.upper()} Stall Pressure (10s)",
+                                "short_label": f"PSI-{res.upper()[:1]}",
+                                "value": round(val, 2),
+                                "val_text": f"{val:.1f}%",
+                                "unit": "%",
+                                "min": 0,
+                                "max": 100,
+                                "pct": max(0.0, min(1.0, val / 100.0)),
+                                "icon": "gauge",
+                                "default_color": "red" if val > 20 else "purple",
+                            }
+        except OSError:
+            pass
+    return results
 
-    if active_cfg is None:
-        active_cfg = cfg.get("active_sensors")
 
-    if not isinstance(active_cfg, list) or len(active_cfg) == 0:
-        active_cfg = build_default_active_list(sensors)
-        if sensors_json_path:
+def collect_all_sensors() -> Dict[str, Dict[str, Any]]:
+    catalog = {}
+    catalog.update(sample_filesystems())
+    catalog.update(sample_cpu())
+    catalog.update(sample_memory())
+    catalog.update(sample_gpus())
+    catalog.update(sample_hwmon())
+    catalog.update(sample_network())
+    catalog.update(sample_battery())
+    catalog.update(sample_psi())
+    return catalog
+
+
+# ==============================================================================
+# Gauge Graphic Renderers
+# ==============================================================================
+
+def render_arc_gauge(
+    pct: float,
+    palette_name: str,
+    size: int,
+    start_ang: float,
+    sweep: float,
+    cx: float,
+    cy: float,
+    r_mid: float,
+    stroke_width: int = 7,
+    scale: int = 3,
+) -> Image.Image:
+    pct = max(0.0, min(1.0, pct))
+    w, h = size * scale, size * scale
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    accent_rgb = resolve_color(palette_name)
+    arc_width = stroke_width * scale
+    cap_r = arc_width * 0.5
+    bead_r = arc_width * 0.58
+    r_outer = r_mid + arc_width / 2.0
+    bbox = [cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer]
+
+    end_ang = start_ang + sweep
+
+    # Background track with rounded caps
+    for ang in (start_ang, end_ang):
+        rad = math.radians(ang)
+        x = cx + r_mid * math.cos(rad)
+        y = cy + r_mid * math.sin(rad)
+        draw.ellipse([x - cap_r, y - cap_r, x + cap_r, y + cap_r], fill=TRACK_COLOR)
+    draw.arc(bbox, start=start_ang, end=end_ang, fill=TRACK_COLOR, width=int(arc_width))
+
+    # Active fill arc
+    active_end = start_ang + (sweep * pct)
+    if pct > 0.01:
+        s_rad = math.radians(start_ang)
+        sx = cx + r_mid * math.cos(s_rad)
+        sy = cy + r_mid * math.sin(s_rad)
+        draw.ellipse([sx - cap_r, sy - cap_r, sx + cap_r, sy + cap_r], fill=(*accent_rgb, 255))
+        draw.arc(bbox, start=start_ang, end=active_end, fill=(*accent_rgb, 255), width=int(arc_width))
+
+    # Needle indicator bead with specular center
+    tip_rad = math.radians(active_end)
+    tip_x = cx + r_mid * math.cos(tip_rad)
+    tip_y = cy + r_mid * math.sin(tip_rad)
+    draw.ellipse([tip_x - bead_r, tip_y - bead_r, tip_x + bead_r, tip_y + bead_r], fill=(*accent_rgb, 255))
+    highlight_rgb = tuple(min(255, int(c * 1.35) + 30) for c in accent_rgb)
+    core_r = bead_r * 0.45
+    draw.ellipse([tip_x - core_r, tip_y - core_r, tip_x + core_r, tip_y + core_r], fill=(*highlight_rgb, 255))
+
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def render_full_tachometer(
+    pct: float,
+    palette_name: str,
+    size: int,
+    stroke_width: int = 7,
+    scale: int = 3,
+) -> Image.Image:
+    w = size * scale
+    arc_width = stroke_width * scale
+    bead_r = arc_width * 0.58
+    pad = int(bead_r + 3)
+    r_outer = (w - 2 * pad) / 2.0
+    r_mid = r_outer - arc_width / 2.0
+    cx, cy = w / 2.0, w / 2.0
+    return render_arc_gauge(pct, palette_name, size, 105.0, 330.0, cx, cy, r_mid, stroke_width, scale)
+
+
+def render_quarter_tachometer(
+    pct: float,
+    palette_name: str,
+    size: int,
+    stroke_width: int = 7,
+    scale: int = 3,
+) -> Image.Image:
+    w = size * scale
+    arc_width = stroke_width * scale
+    bead_r = arc_width * 0.58
+    margin = int(bead_r + 2)
+    cx = cy = w - margin
+    r_mid = cx - margin
+    return render_arc_gauge(pct, palette_name, size, 180.0, 90.0, cx, cy, r_mid, stroke_width, scale)
+
+
+def render_vertical_bar(
+    pct: float,
+    palette_name: str,
+    size: int,
+    stroke_width: int = 7,
+    scale: int = 3,
+) -> Image.Image:
+    pct = max(0.0, min(1.0, pct))
+    w, h = size * scale, size * scale
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    accent_rgb = resolve_color(palette_name)
+    bar_w = int(max(10, size * 0.28) * scale)
+    cx = w // 2
+    pad_y = int(4 * scale)
+
+    x0 = cx - bar_w // 2
+    x1 = cx + bar_w // 2
+    y0 = pad_y
+    y1 = h - pad_y
+    radius = bar_w // 2
+
+    draw.rounded_rectangle([x0, y0, x1, y1], radius=radius, fill=TRACK_COLOR)
+
+    total_height = y1 - y0
+    fill_height = int(total_height * pct)
+    if fill_height > 2:
+        fill_y0 = y1 - fill_height
+        draw.rounded_rectangle([x0, fill_y0, x1, y1], radius=radius, fill=(*accent_rgb, 255))
+
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def render_geometric_wifi(
+    pct: float,
+    palette_name: str,
+    size: int,
+    stroke_width: int = 7,
+    scale: int = 3,
+) -> Image.Image:
+    pct = max(0.0, min(1.0, pct))
+    w, h = size * scale, size * scale
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    accent_rgb = resolve_color(palette_name)
+    arc_w = int(max(3, stroke_width * 0.7) * scale)
+    cx = w // 2
+    base_y = int(h * 0.88)
+
+    thresholds = [0.08, 0.35, 0.65, 0.90]
+    radii = [int(size * scale * factor) for factor in [0.20, 0.42, 0.64, 0.84]]
+    start_ang, end_ang = 225.0, 315.0
+
+    for i in range(4):
+        r = radii[i]
+        bbox = [cx - r, base_y - r, cx + r, base_y + r]
+        color = (*accent_rgb, 255) if pct >= thresholds[i] else TRACK_COLOR
+        draw.arc(bbox, start=start_ang, end=end_ang, fill=color, width=arc_w)
+
+    dot_r = int(arc_w * 1.1)
+    dot_color = (*accent_rgb, 255) if pct > 0.02 else TRACK_COLOR
+    draw.ellipse([cx - dot_r, base_y - dot_r, cx + dot_r, base_y + dot_r], fill=dot_color)
+
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def render_geometric_cellular(
+    pct: float,
+    palette_name: str,
+    size: int,
+    stroke_width: int = 7,
+    scale: int = 3,
+) -> Image.Image:
+    pct = max(0.0, min(1.0, pct))
+    w, h = size * scale, size * scale
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    accent_rgb = resolve_color(palette_name)
+    num_bars = 4
+    thresholds = [0.08, 0.35, 0.65, 0.90]
+    height_ratios = [0.30, 0.52, 0.74, 0.96]
+
+    pad_x = int(6 * scale)
+    pad_y = int(4 * scale)
+    usable_w = w - (2 * pad_x)
+    bar_w = int(usable_w / (num_bars * 1.5))
+    gap = int((usable_w - (num_bars * bar_w)) / (num_bars - 1))
+    bottom_y = h - pad_y
+
+    for i in range(num_bars):
+        bx0 = pad_x + i * (bar_w + gap)
+        bx1 = bx0 + bar_w
+        bar_h = int((h - 2 * pad_y) * height_ratios[i])
+        by0 = bottom_y - bar_h
+
+        color = (*accent_rgb, 255) if pct >= thresholds[i] else TRACK_COLOR
+        radius = bar_w // 2
+        draw.rounded_rectangle([bx0, by0, bx1, bottom_y], radius=radius, fill=color)
+
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def render_graph_for_instance(
+    graph_type: str,
+    pct: float,
+    color: str,
+    size: int,
+    stroke_width: int = 7,
+) -> Optional[Image.Image]:
+    if not HAS_PIL:
+        return None
+
+    if graph_type == "tachometer_quarter":
+        return render_quarter_tachometer(pct, color, size, stroke_width)
+    elif graph_type == "bar_vertical":
+        return render_vertical_bar(pct, color, size, stroke_width)
+    elif graph_type == "geometric_wifi":
+        return render_geometric_wifi(pct, color, size, stroke_width)
+    elif graph_type == "geometric_cellular":
+        return render_geometric_cellular(pct, color, size, stroke_width)
+    return render_full_tachometer(pct, color, size, stroke_width)
+
+
+# ==============================================================================
+# Instance Config Storage & IPC
+# ==============================================================================
+
+def load_instances() -> Dict[str, Dict[str, Any]]:
+    if os.path.exists(INSTANCES_FILE):
+        try:
+            with open(INSTANCES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data:
+                    return data
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    save_instances(DEFAULT_INSTANCES)
+    return copy.deepcopy(DEFAULT_INSTANCES)
+
+
+def save_instances(instances: Dict[str, Dict[str, Any]]) -> None:
+    tmp_path = INSTANCES_FILE + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(instances, f, indent=2)
+        os.replace(tmp_path, INSTANCES_FILE)
+    except OSError:
+        pass
+
+
+def process_incoming_commands(
+    instances: Dict[str, Dict[str, Any]],
+    poll_interval: float = 2.0,
+    bar_size: int = 34,
+    desktop_size: int = 96,
+) -> Tuple[Dict[str, Dict[str, Any]], bool, float, int, int]:
+    changed = False
+    proc_file = CMD_FILE + f".proc.{os.getpid()}"
+    try:
+        os.replace(CMD_FILE, proc_file)
+    except OSError:
+        return instances, changed, poll_interval, bar_size, desktop_size
+
+    cmd = None
+    try:
+        with open(proc_file, "r", encoding="utf-8") as f:
+            cmd = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    finally:
+        try:
+            os.remove(proc_file)
+        except OSError:
+            pass
+
+    if not cmd or not isinstance(cmd, dict):
+        return instances, changed, poll_interval, bar_size, desktop_size
+
+    action = cmd.get("action")
+    if action == "configure":
+        new_poll = cmd.get("poll_interval")
+        if isinstance(new_poll, (int, float)) and 0.2 <= new_poll <= 30.0:
+            poll_interval = float(new_poll)
+        new_bar = cmd.get("bar_size")
+        if isinstance(new_bar, int) and 20 <= new_bar <= 120:
+            bar_size = new_bar
+            changed = True
+        new_desk = cmd.get("desktop_size")
+        if isinstance(new_desk, int) and 40 <= new_desk <= 240:
+            desktop_size = new_desk
+            changed = True
+    elif action == "save_instance":
+        inst = cmd.get("instance")
+        if inst and "id" in inst:
+            instances[inst["id"]] = inst
+            changed = True
+    elif action == "ensure_instance":
+        inst_id = cmd.get("instance_id")
+        if inst_id and inst_id not in instances:
+            instances[inst_id] = {
+                "id": inst_id,
+                "name": inst_id,
+                "sensor_id": "cpu/total_usage",
+                "color": "cyan",
+                "show_icon": True,
+                "icon_type": "glyph",
+                "icon_val": "cpu",
+                "show_graph": True,
+                "graph_type": "tachometer_quarter",
+                "stroke_width": 7,
+                "show_value": True,
+                "decimals": 0,
+                "show_label": True,
+                "label": "CPU",
+            }
+            changed = True
+    elif action == "delete_instance":
+        inst_id = cmd.get("instance_id")
+        if inst_id in instances:
+            del instances[inst_id]
+            changed = True
+    elif action == "reset_defaults":
+        instances = copy.deepcopy(DEFAULT_INSTANCES)
+        changed = True
+
+    if changed and action != "configure":
+        save_instances(instances)
+
+    return instances, changed, poll_interval, bar_size, desktop_size
+
+
+# ==============================================================================
+# Snapshot Builder & Cache Management
+# ==============================================================================
+
+def build_snapshot(
+    instances: Dict[str, Dict[str, Any]],
+    all_sensors: Dict[str, Dict[str, Any]],
+    bar_size: int = 34,
+    desktop_size: int = 96,
+) -> Dict[str, Any]:
+    global _INSTANCE_FILES, _INSTANCE_RENDER_KEYS
+    stamp = int(time.time() * 1000)
+    rendered_instances = {}
+
+    for inst_id, cfg in instances.items():
+        sensor_id = cfg.get("sensor_id") or "cpu/total_usage"
+        sensor = all_sensors.get(sensor_id)
+        if not sensor and all_sensors:
+            sensor = all_sensors.get("cpu/total_usage") or list(all_sensors.values())[0]
+
+        val = sensor["value"] if sensor else 0.0
+        pct = sensor["pct"] if sensor else 0.0
+        val_text = sensor["val_text"] if sensor else "0"
+        unit = sensor["unit"] if sensor else ""
+
+        decimals = int(cfg.get("decimals") or 0)
+        stroke_width = int(cfg.get("stroke_width") or 7)
+
+        if isinstance(val, (int, float)):
+            if unit == "%":
+                val_text = f"{val:.{decimals}f}%"
+            elif unit == "°C":
+                val_text = f"{val:.{decimals}f}°C"
+            elif unit in ("rate", "human"):
+                pass
+            elif unit:
+                val_text = f"{val:.{decimals}f} {unit}"
+            else:
+                val_text = f"{val:.{decimals}f}"
+
+        color = cfg.get("color") or "cyan"
+        graph_type = cfg.get("graph_type") or "tachometer_quarter"
+
+        if inst_id not in _INSTANCE_FILES:
+            _INSTANCE_FILES[inst_id] = {}
+        if inst_id not in _INSTANCE_RENDER_KEYS:
+            _INSTANCE_RENDER_KEYS[inst_id] = {}
+
+        bar_img_path = _INSTANCE_FILES[inst_id].get("bar", "")
+        desk_img_path = _INSTANCE_FILES[inst_id].get("desk", "")
+
+        if cfg.get("show_graph", True) and HAS_PIL:
+            quantized_pct = round(pct, 3)
+            bar_key = (graph_type, quantized_pct, color, bar_size, stroke_width)
+            desk_stroke = max(stroke_width, int(round(stroke_width * (desktop_size / 34.0))))
+            desk_key = (graph_type, quantized_pct, color, desktop_size, desk_stroke)
+
+            if _INSTANCE_RENDER_KEYS[inst_id].get("bar") != bar_key or not bar_img_path or not os.path.exists(bar_img_path):
+                img_bar = render_graph_for_instance(graph_type, pct, color, bar_size, stroke_width)
+                if img_bar:
+                    slot = "1" if bar_img_path.endswith("_0.png") else "0"
+                    new_bar_path = os.path.join(ASSETS_DIR, f"{inst_id}_bar_{slot}.png")
+                    img_bar.save(new_bar_path)
+                    if bar_img_path and bar_img_path != new_bar_path:
+                        try:
+                            os.remove(bar_img_path)
+                        except OSError:
+                            pass
+                    bar_img_path = new_bar_path
+                    _INSTANCE_FILES[inst_id]["bar"] = new_bar_path
+                    _INSTANCE_RENDER_KEYS[inst_id]["bar"] = bar_key
+
+            if _INSTANCE_RENDER_KEYS[inst_id].get("desk") != desk_key or not desk_img_path or not os.path.exists(desk_img_path):
+                img_desk = render_graph_for_instance(graph_type, pct, color, desktop_size, desk_stroke)
+                if img_desk:
+                    slot = "1" if desk_img_path.endswith("_0.png") else "0"
+                    new_desk_path = os.path.join(ASSETS_DIR, f"{inst_id}_desk_{slot}.png")
+                    img_desk.save(new_desk_path)
+                    if desk_img_path and desk_img_path != new_desk_path:
+                        try:
+                            os.remove(desk_img_path)
+                        except OSError:
+                            pass
+                    desk_img_path = new_desk_path
+                    _INSTANCE_FILES[inst_id]["desk"] = new_desk_path
+                    _INSTANCE_RENDER_KEYS[inst_id]["desk"] = desk_key
+
+        rendered_instances[inst_id] = {
+            "id": inst_id,
+            "name": cfg.get("name") or inst_id,
+            "sensor_id": sensor_id,
+            "sensor_name": sensor["name"] if sensor else sensor_id,
+            "value": val,
+            "val_text": val_text,
+            "unit": unit,
+            "pct": pct,
+            "color": color,
+            "show_icon": cfg.get("show_icon", True),
+            "icon_type": cfg.get("icon_type", "glyph"),
+            "icon_val": cfg.get("icon_val", "cpu"),
+            "show_graph": cfg.get("show_graph", True),
+            "graph_type": graph_type,
+            "stroke_width": stroke_width,
+            "show_value": cfg.get("show_value", True),
+            "decimals": decimals,
+            "show_label": cfg.get("show_label", True),
+            "label": cfg.get("label", "CPU"),
+            "bar_img": bar_img_path,
+            "desk_img": desk_img_path,
+            "bar_size": bar_size,
+            "desktop_size": desktop_size,
+        }
+
+    catalog_list = list(all_sensors.values())
+    catalog_list.sort(key=lambda s: (s["category"], s["name"]))
+
+    return {
+        "stamp": str(stamp),
+        "instances": rendered_instances,
+        "catalog": catalog_list,
+        "categories": sorted(list(set(s["category"] for s in catalog_list))),
+    }
+
+
+def write_snapshot_file(snapshot_json: str) -> None:
+    tmp_snap = SNAPSHOT_FILE + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp_snap, "w", encoding="utf-8") as f:
+            f.write(snapshot_json)
+        os.replace(tmp_snap, SNAPSHOT_FILE)
+    except OSError:
+        pass
+
+
+def cleanup_stale_assets() -> None:
+    try:
+        for p in glob.glob(os.path.join(ASSETS_DIR, "*.png")):
+            os.remove(p)
+    except OSError:
+        pass
+
+
+# ==============================================================================
+# Main Runner (Daemon & One-shot)
+# ==============================================================================
+
+def run_daemon(poll_interval: float, bar_size: int, desktop_size: int) -> None:
+    global _PREV_CPU_TIMES, _PREV_NET_BYTES
+    _PREV_CPU_TIMES, _PREV_NET_BYTES = load_daemon_state()
+    cleanup_stale_assets()
+
+    pid_fd = None
+    try:
+        pid_fd = os.open(DAEMON_PID_FILE, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(pid_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(pid_fd, 0)
+        os.write(pid_fd, f"{os.getpid()}\n".encode())
+    except (BlockingIOError, OSError):
+        if pid_fd is not None:
             try:
-                os.makedirs(os.path.dirname(sensors_json_path), exist_ok=True)
-                with open(sensors_json_path + ".tmp", "w", encoding="utf-8") as f:
-                    json.dump(active_cfg, f, indent=2)
-                os.replace(sensors_json_path + ".tmp", sensors_json_path)
+                os.close(pid_fd)
+            except OSError:
+                pass
+        sys.exit(0)
+
+    try:
+        instances = load_instances()
+        while True:
+            instances, _, poll_interval, bar_size, desktop_size = process_incoming_commands(
+                instances, poll_interval, bar_size, desktop_size
+            )
+            all_sensors = collect_all_sensors()
+            snapshot = build_snapshot(instances, all_sensors, bar_size, desktop_size)
+            snapshot_json = json.dumps(snapshot)
+
+            write_snapshot_file(snapshot_json)
+
+            try:
+                sys.stdout.write(snapshot_json + "\n")
+                sys.stdout.flush()
+            except (BrokenPipeError, IOError):
+                break
+
+            deadline = time.monotonic() + poll_interval
+            while time.monotonic() < deadline:
+                if os.path.exists(CMD_FILE):
+                    break
+                time.sleep(min(0.25, max(0.05, deadline - time.monotonic())))
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+    finally:
+        save_daemon_state(_PREV_CPU_TIMES, _PREV_NET_BYTES)
+        if pid_fd is not None:
+            try:
+                fcntl.flock(pid_fd, fcntl.LOCK_UN)
+                os.close(pid_fd)
+                if os.path.exists(DAEMON_PID_FILE):
+                    os.remove(DAEMON_PID_FILE)
             except OSError:
                 pass
 
-    stamp = int(time.time() * 1000)
-    rendered_active: List[Dict[str, Any]] = []
 
-    for idx, item in enumerate(active_cfg):
-        if not isinstance(item, dict):
-            continue
-        sid = str(item.get("id", ""))
-        sdata = sensors.get(sid)
-        if not sdata:
-            continue
+def run_once(bar_size: int, desktop_size: int) -> None:
+    global _PREV_CPU_TIMES, _PREV_NET_BYTES
+    _PREV_CPU_TIMES, _PREV_NET_BYTES = load_daemon_state()
 
-        gtype = str(item.get("graph_type", "ring"))
-        if gtype not in ("ring", "bar", "histogram"):
-            gtype = "ring"
-        color = str(item.get("color", sdata.get("default_color", "blue")))
-        custom_label = str(item.get("label") or sdata["short_label"])
+    instances = load_instances()
+    instances, _, _, bar_size, desktop_size = process_incoming_commands(instances, 2.0, bar_size, desktop_size)
 
-        sensor_copy = dict(sdata)
-        sensor_copy["short_label"] = custom_label
+    all_sensors = collect_all_sensors()
+    snapshot = build_snapshot(instances, all_sensors, bar_size, desktop_size)
+    snapshot_json = json.dumps(snapshot)
 
-        bar_img_path = ""
-        desk_img_path = ""
-        safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", sid)
+    write_snapshot_file(snapshot_json)
+    save_daemon_state(_PREV_CPU_TIMES, _PREV_NET_BYTES)
 
-        if item.get("show_graph", True) is not False and HAS_PIL:
-            if item.get("on_bar", True) is not False:
-                bpath = os.path.join(RUNTIME_BASE, f"bar_{idx}_{safe_id}.png")
-                if render_sensor_graph(sensor_copy, gtype, color, theme, bar_size, compact=(bar_size < 52), out_path=bpath):
-                    bar_img_path = bpath
-            if item.get("on_desktop", True) is not False or True:
-                dpath = os.path.join(RUNTIME_BASE, f"desk_{idx}_{safe_id}.png")
-                if render_sensor_graph(sensor_copy, gtype, color, theme, desktop_size, compact=False, out_path=dpath):
-                    desk_img_path = dpath
+    print(json.dumps({"status": "ok", "instances": len(snapshot["instances"]), "sensors": len(snapshot["catalog"])}))
 
-        rendered_active.append(
-            {
-                "id": sid,
-                "name": sdata["name"],
-                "category": sdata["category"],
-                "label": custom_label,
-                "val_text": sdata["val_text"],
-                "sub_text": sdata["sub_text"],
-                "percent": sdata["percent"],
-                "icon": sdata["icon"],
-                "graph_type": gtype,
-                "color": color,
-                "show_icon": bool(item.get("show_icon", False)),
-                "show_label": bool(item.get("show_label", True)),
-                "show_value": bool(item.get("show_value", True)),
-                "show_graph": bool(item.get("show_graph", True)),
-                "on_bar": bool(item.get("on_bar", True)),
-                "on_desktop": bool(item.get("on_desktop", True)),
-                "bar_img": bar_img_path,
-                "desk_img": desk_img_path,
-                "bar_w": bar_size if gtype == "ring" else int(bar_size * 1.5),
-                "bar_h": bar_size if gtype == "ring" else (int(bar_size * 0.42) if gtype == "bar" else int(bar_size * 0.72)),
-                "desk_w": desktop_size if gtype == "ring" else int(desktop_size * 1.15),
-                "desk_h": desktop_size if gtype == "ring" else (int(desktop_size * 0.34) if gtype == "bar" else int(desktop_size * 0.68)),
-            }
-        )
 
-    # Compact catalog for the interactive sensor picker panel
-    catalog_list = [
-        {
-            "id": s["id"],
-            "category": s["category"],
-            "name": s["name"],
-            "short_label": s["short_label"],
-            "val_text": s["val_text"],
-            "sub_text": s["sub_text"],
-            "icon": s["icon"],
-            "default_color": s["default_color"],
-        }
-        for s in sensors.values()
-    ]
-    catalog_list.sort(key=lambda x: (x["category"], x["name"]))
+def main():
+    parser = argparse.ArgumentParser(description="TachoPulse Telemetry Engine")
+    parser.add_argument("--daemon", action="store_true", help="Run as background streaming daemon")
+    parser.add_argument("--bar-size", type=int, default=34, help="Bar gauge pixel size (20-120)")
+    parser.add_argument("--desktop-size", type=int, default=96, help="Desktop gauge pixel size (40-240)")
+    parser.add_argument("--poll", "--poll-interval", dest="poll_interval", type=float, default=2.0, help="Poll interval in seconds (0.5-10.0)")
+    args = parser.parse_args()
 
-    output = {
-        "stamp": str(stamp),
-        "active": rendered_active,
-        "catalog": catalog_list,
-    }
+    bar_size = max(20, min(120, args.bar_size))
+    desktop_size = max(40, min(240, args.desktop_size))
+    poll_interval = max(0.5, min(10.0, args.poll_interval))
 
-    try:
-        with open(SNAPSHOT_FILE + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(output, f)
-        os.replace(SNAPSHOT_FILE + ".tmp", SNAPSHOT_FILE)
-    except OSError:
-        pass
-
-    print(json.dumps({"status": "ok", "snapshot": SNAPSHOT_FILE, "stamp": str(stamp)}))
+    if args.daemon:
+        run_daemon(poll_interval, bar_size, desktop_size)
+    else:
+        run_once(bar_size, desktop_size)
 
 
 if __name__ == "__main__":
