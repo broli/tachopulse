@@ -1,79 +1,126 @@
 # TachoPulse (`broli/tachopulse`)
 
-**Dynamic KDE-Style Hardware Telemetry Widget & Desktop Monitor for Noctalia v5 (`plugin_api = 32`)**
+**Modular Hardware & Storage Telemetry Widget for Noctalia v5 (`plugin_api = 32`)**
 
-**TachoPulse** combines **KDE Plasma System Monitor's** (`ksystemstats` / `libksysguard`) hardware-agnostic sensor discovery engine with **3x supersampled glowing visualizations** (`Ring` tachometer, `Bar` level meter, and `Histogram` rolling sparkline) for both the **Noctalia Status Bar** (`[[widget]]`) and **Desktop Wallpaper** (`[[desktop_widget]]`).
+TachoPulse provides modular, real-time hardware telemetry for the **Noctalia Status Bar** (`[[widget]]`) and **Desktop Wallpaper** (`[[desktop_widget]]`). It pairs a dynamic Linux sensor discovery engine with anti-aliased rendered gauges (Automotive Tachometer, Corner Quarter-Tachometer, Vertical Capsule Bar, and Geometric Radiating Arcs).
 
----
+<div align="center">
 
-## ✨ Key Features
+![TachoPulse Status Bar Telemetry](assets/tacho-30fps_last10s.gif) &nbsp; ![TachoPulse Modular Gauges](assets/tacho2-30fps_last10s.gif)
 
-- **100% Hardware-Agnostic Discovery (Zero Hardcoding)**:
-  Dynamically enumerates every sensor available on any Linux machine at runtime:
-  - **Multi-GPU Support (`nvtop -s` + `/sys/class/drm/card*`)**: Discovers all GPUs individually (e.g., NVIDIA discrete GPU + Intel/AMD integrated GPU) with per-GPU Load %, VRAM Used/Free, Temperature, Power Draw, and GT Clocks.
-  - **CPU (`/proc/stat` + `cpufreq` + `coretemp`/`k10temp`/`zenpower`)**: Total load, package temperature, average/max core clocks, 1m/5m load averages, and individual per-core threads (`cpu0..cpuN`).
-  - **Motherboard & Chipset Sensors (`/sys/class/hwmon/hwmon*`)**: Every temperature probe (`temp*_input`), cooling fan RPM (`fan*_input`), power draw (`power*_input`), and thermal zone (CPU/GPU fans, NVMe drives, DDR5 SPD hubs, ACPI thermal zones).
-  - **Memory, Storage, Network & PSI Pressure**: Physical RAM, Swap, root filesystem usage, per-disk read/write throughput (`/proc/diskstats`), per-interface RX/TX bandwidth (`/proc/net/dev`), battery charge (`/sys/class/power_supply/*`), and Linux PSI stall pressure (`/proc/pressure/{cpu,memory,io}`).
-- **Two Synchronized Widget Modes**:
-  1. **Status Bar Widget (`bar.luau`)**: Adaptive compact or full-ring telemetry directly in your top, bottom, or vertical side bar.
-  2. **Desktop Widget (`desktop.luau`)**: Translucent multi-column card grid pinned to your desktop wallpaper.
-- **Interactive Sensor Studio (`panel.luau`)**:
-  Click the bar widget to open **TachoPulse Sensor Studio**, where you can:
-  - Browse & search all discovered hardware sensors on your system with live readings.
-  - Switch any sensor between **`Ring`** (circular tachometer), **`Bar`** (capsule meter), and **`Hist`** (rolling 30-sample area sparkline).
-  - Toggle **`Icon`**, **`Label`**, **`Value`**, **`Graph`**, **`Top Bar`**, and **`Desktop`** visibility per sensor.
-  - Cycle through 7 glowing color palettes (`blue`, `cyan`, `green`, `orange`, `purple`, `red`, `yellow`) and reorder sensors on the fly.
+</div>
 
 ---
 
-## 📏 Status Bar Thickness Recommendations
+## The Core Concept: Independent Named Widgets
 
-TachoPulse never assumes a fixed bar height and automatically adapts its rendering based on the **Bar Graph Size (`bar_gauge_size`)** setting:
+Rather than bundling every hardware metric into a single monolithic, cluttered widget, **TachoPulse is designed for users to add multiple named widgets to their Noctalia bar and desktop, each configured completely separately**.
 
-| Bar Thickness | Recommended `bar_gauge_size` | Rendering Mode |
-| :--- | :--- | :--- |
-| **Standard Slim Bar (`32px–44px`)** | `30px–38px` *(Default: `34px`)* | **Compact High-Contrast Mode (`< 52px`)**: Draws a bold single value inside the glowing ring and places the sensor label & sub-metric cleanly inline beside the ring so text is never cramped. |
-| **Tall Telemetry Bar (`56px–72px`)** | `52px–64px` | **Full 3-Line Tachometer Mode (`>= 52px`)**: Draws all 3 lines (`Value`, `Label`, `Sub-metric` like `°C` or `+Free VRAM`) inside the glowing ring itself. |
-| **Desktop Wallpaper Widget** | `80px–140px` *(Default: `96px`)* | **Full 3-Line Tachometer Mode**: Full-sized glowing rings, capsule bars, and time-series histograms on your desktop. |
+- **Add Multiple Discrete Widgets**: Place as many independent widgets as desired anywhere across your bar order (`cpu_tach`, `gpu_temp`, `disk_free`, `wifi_net`).
+- **Separate Instance Profiles**: Each widget entry points to its own `instance_id` (e.g. `instance_id = "default"`, `instance_id = "cpu_temp"`, `instance_id = "storage_free"`).
+- **Independent Visuals & Sensor Bindings**: Configure one widget as a compact cyan quarter-tachometer for CPU load, another as an orange speedometer with a 🔥 emoji for GPU temperature, a third as a green vertical capsule bar for root drive free space, and a fourth as radiating WiFi signal arcs.
+- **Dedicated 1-Click Studio**: Clicking any widget instance in your status bar or on your desktop opens TachoPulse Studio pre-focused on that specific widget's profile, allowing live sensor selection and visual tuning with immediate feedback.
 
 ---
 
-## 📦 Dependencies
+## Features
+
+- **4 Modular Face Elements (Freely Toggle Any Combination)**:
+  1. **Icon**: Tabler Nerd glyph (e.g. `cpu`, `flame`, `database`, `car-fan`, `wifi`) or custom Emoji / Unicode (e.g. 💾, 🔥, ⚡, 📶, 🚀).
+  2. **Graphic Gauge**:
+     - **Full Tachometer**: ~330° automotive gauge with background track, active arc, and needle bead.
+     - **Quarter Tachometer**: 90° corner arc maximizing horizontal space for bar text.
+     - **Vertical Bar**: Linear capsule filling from bottom to top.
+     - **Geometric Arcs / Bars**: Concentric radiating WiFi arcs or stepped cellular signal bars.
+  3. **Live Value**: Formatted live number with contextual unit (`%`, `°C`, `GB`, `RPM`, `MB/s`, `W`) and custom decimal precision (0, 1, or 2 decimals).
+  4. **Label**: Freeform user text (e.g. `"CPU"`, `"RTX 4070"`, `"/home"`, `"Fan 1"`).
+
+- **Linux Telemetry Discovery Engine (KDE ksystemstats Inspired)**:
+  - **Storage & Filesystems (`statvfs` & `/proc/mounts`)**: Physical mount points (`/`, `/home`, secondary drives) reporting Free Space (GB/TB), Used Space (GB/TB), Free %, and Used %.
+  - **Multi-GPU (`nvtop -s` + DRM sysfs)**: Discrete NVIDIA and integrated AMD/Intel GPUs with per-GPU load %, VRAM usage, temperatures, and power draw.
+  - **CPU (`/proc/stat` + `cpufreq`)**: Total load, package temperature (Tctl), average/max clock frequencies, load averages, and per-core threads (`cpu0`..`cpuN`).
+  - **Motherboard & Chipset (`hwmon`)**: Temperature probes, fan RPMs, voltages, and thermal zones.
+  - **Memory & Swap**: Physical RAM used/available, swap utilization.
+  - **Network (`/proc/net/dev`)**: Real-time download/upload transfer rates.
+  - **Battery & Linux PSI**: Charge %, charging status, power draw, and CPU/memory/IO stall pressure.
+
+- **Interactive Configuration Studio & Sensor Picker (`panel.luau`)**:
+  Click any status bar widget or desktop card to open the Studio:
+  - **Modular Element Toggles**: Toggle any combination of the four face elements on/off.
+  - **Native Dropdowns (`ui.select`)**: Vibrant color palette presets (Cyan, Blue, Green, Orange, Purple, Red, Yellow), graph styles, stroke widths, and precision.
+  - **KDE-Style Sensor Picker**: Filterable search bar (matches sensor name, category, sensor ID, and short label), category tabs, and live fluctuating readings with 1-click binding.
+
+---
+
+## Dependencies
 
 - **Required**:
   - `noctalia` (`>= 5.3.0`, `plugin_api = 32`)
-  - `python3` + `python-pillow` (`PIL` for 3x supersampled LANCZOS graph rendering)
+  - `python3` + `python-pillow` (`PIL` for anti-aliased graph rendering)
 - **Recommended (for Multi-GPU NVIDIA / AMD / Intel Telemetry)**:
-  - `nvtop` (used via `nvtop -s` for JSON multi-GPU load, VRAM, temperature, and power queries; falls back cleanly to `/sys/class/drm/card*` if `nvtop` is not installed)
+  - `nvtop` (used via `nvtop -s` for JSON multi-GPU telemetry; falls back to DRM sysfs if not installed)
 
-On Arch Linux / CachyOS:
+Installation by distribution:
 ```bash
+# Arch Linux / CachyOS
 sudo pacman -S python python-pillow nvtop
+
+# Debian / Ubuntu
+sudo apt install python3 python3-pil nvtop
+
+# Fedora
+sudo dnf install python3 python3-pillow nvtop
 ```
 
 ---
 
-## 🚀 Installation
+## Installation & Setup
 
-### Option 1: Install from Local Widgets Directory (Live Development)
-If you keep your Noctalia widgets inside `~/Projects/Widgets` (with this repo at `~/Projects/Widgets/tachopulse`):
+### 1. Enable TachoPulse in Noctalia
+If developing locally in `~/Projects/Widgets/tachopulse`:
 ```bash
-noctalia msg plugins source add local-widgets path /home/carlos/Projects/Widgets
+noctalia msg plugins source add local-widgets path ~/Projects/Widgets
 noctalia msg plugins enable broli/tachopulse
 ```
 
-### Option 2: Install Directly from GitHub
-```bash
-noctalia msg plugins source add tachopulse git https://github.com/broli/tachopulse
-noctalia msg plugins enable broli/tachopulse
+### 2. Configure Named Bar Widgets
+In your Noctalia configuration (`~/.config/noctalia/config.toml`) or via **Noctalia Settings → Bar**:
+```toml
+# 1. Add your named widget identifiers to your bar order
+[bar.BaseBar.monitor.eDP-1]
+start = [ "workspaces" ]
+center = [ "clock" ]
+end = [ "cpu_tach", "gpu_tach", "disk_free", "wifi_net", "tray", "volume" ]
+
+# 2. Configure each named instance separately with its unique instance_id
+[widget.cpu_tach]
+type = "broli/tachopulse:gauge"
+instance_id = "default"         # e.g. Bound to CPU Load (Cyan Quarter-Tach)
+
+[widget.gpu_tach]
+type = "broli/tachopulse:gauge"
+instance_id = "cpu_temp"        # e.g. Bound to GPU Temp (Orange Full-Tach + 🔥)
+
+[widget.disk_free]
+type = "broli/tachopulse:gauge"
+instance_id = "storage_free"    # e.g. Bound to Root Free Space (Green Vertical Capsule)
+
+[widget.wifi_net]
+type = "broli/tachopulse:gauge"
+instance_id = "wifi_net"        # e.g. Bound to Wi-Fi Download Rate (Blue Radiating Arcs)
 ```
 
-Then add **TachoPulse** (`broli/tachopulse:bar`) to any monitor bar in **Noctalia Settings → Bar**, or enable the **TachoPulse Desktop Widget** (`broli/tachopulse:desktop`) in **Noctalia Settings → Desktop Widgets**.
+### 3. Configure Named Desktop Widgets (Optional)
+You can pin independent telemetry cards to your desktop wallpaper in the same way:
+```toml
+# Desktop Wallpaper widget instances (configured separately)
+[desktop_widget.cpu_card]
+type = "broli/tachopulse:desktop"
+instance_id = "default"
 
----
+[desktop_widget.disk_card]
+type = "broli/tachopulse:desktop"
+instance_id = "storage_free"
+```
 
-## 🙏 Credits & License
-
-Licensed under **GPL-2.0-or-later** (see [LICENSE](./LICENSE)):
-- **Hardware Sensor Identification & Classification Engine**: Adapted from **KDE Plasma's `ksystemstats` and `libksysguard`** plugins (`cpu`, `gpu`, `lmsensors`, `memory`, `disk`, `network`, `power`, `pressure`) by the KDE Project Contributors.
-- **Supersampled Capsule-Arc Ring Gauge Inspiration**: Inspired by **`tordex/nvtop`** for Noctalia.
+Click any widget instance on your bar or desktop at any time to open **TachoPulse Studio** and customize its face, colors, and sensors live!
