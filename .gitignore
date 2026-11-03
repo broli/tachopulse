@@ -10,5 +10,6 @@ venv/
 *.bak
 .DS_Store
 
-# Local testing output
-/tmp_out/
+# Testing & Linting caches
+.pytest_cache/
+.ruff_cache/

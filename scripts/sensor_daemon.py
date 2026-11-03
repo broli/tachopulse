@@ -18,7 +18,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 try:
     from PIL import Image, ImageDraw
@@ -47,7 +47,7 @@ os.makedirs(RUNTIME_BASE, exist_ok=True)
 os.makedirs(ASSETS_DIR, exist_ok=True)
 os.makedirs(CONFIG_DIR, exist_ok=True)
 
-PALETTE_COLORS: Dict[str, Tuple[int, int, int]] = {
+PALETTE_COLORS: dict[str, tuple[int, int, int]] = {
     "cyan": (86, 214, 214),
     "blue": (120, 180, 255),
     "green": (115, 230, 155),
@@ -59,7 +59,7 @@ PALETTE_COLORS: Dict[str, Tuple[int, int, int]] = {
 }
 
 
-def resolve_color(c: str) -> Tuple[int, int, int]:
+def resolve_color(c: str) -> tuple[int, int, int]:
     if not c:
         return PALETTE_COLORS["cyan"]
     if c in PALETTE_COLORS:
@@ -73,7 +73,7 @@ def resolve_color(c: str) -> Tuple[int, int, int]:
 
 TRACK_COLOR = (90, 100, 135, 235)
 
-DEFAULT_INSTANCES: Dict[str, Dict[str, Any]] = {
+DEFAULT_INSTANCES: dict[str, dict[str, Any]] = {
     "default": {
         "id": "default",
         "name": "CPU Load",
@@ -140,17 +140,17 @@ DEFAULT_INSTANCES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-_PREV_CPU_TIMES: Dict[str, Tuple[int, int]] = {}
-_PREV_NET_BYTES: Dict[str, Tuple[int, int, float]] = {}
+_PREV_CPU_TIMES: dict[str, tuple[int, int]] = {}
+_PREV_NET_BYTES: dict[str, tuple[int, int, float]] = {}
 
-_INSTANCE_FILES: Dict[str, Dict[str, str]] = {}
-_INSTANCE_RENDER_KEYS: Dict[str, Dict[str, Tuple]] = {}
+_INSTANCE_FILES: dict[str, dict[str, str]] = {}
+_INSTANCE_RENDER_KEYS: dict[str, dict[str, tuple]] = {}
 
-_NVTOP_AVAILABLE: Optional[bool] = None
-_NVIDIA_SMI_AVAILABLE: Optional[bool] = None
+_NVTOP_AVAILABLE: bool | None = None
+_NVIDIA_SMI_AVAILABLE: bool | None = None
 
 
-def load_daemon_state() -> Tuple[Dict[str, Tuple[int, int]], Dict[str, Tuple[int, int, float]]]:
+def load_daemon_state() -> tuple[dict[str, tuple[int, int]], dict[str, tuple[int, int, float]]]:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -163,7 +163,7 @@ def load_daemon_state() -> Tuple[Dict[str, Tuple[int, int]], Dict[str, Tuple[int
     return {}, {}
 
 
-def save_daemon_state(cpu: Dict[str, Tuple[int, int]], net: Dict[str, Tuple[int, int, float]]) -> None:
+def save_daemon_state(cpu: dict[str, tuple[int, int]], net: dict[str, tuple[int, int, float]]) -> None:
     tmp_path = STATE_FILE + f".tmp.{os.getpid()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -195,7 +195,7 @@ def format_rate_human(bytes_per_sec: float) -> str:
 # Sensor Discovery & Scraper Engine
 # ==============================================================================
 
-def sample_filesystems() -> Dict[str, Dict[str, Any]]:
+def sample_filesystems() -> dict[str, dict[str, Any]]:
     results = {}
     ignored_fs = {
         "tmpfs", "devtmpfs", "devpts", "sysfs", "proc", "cgroup", "cgroup2",
@@ -320,8 +320,7 @@ def sample_filesystems() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def sample_cpu() -> Dict[str, Dict[str, Any]]:
-    global _PREV_CPU_TIMES
+def sample_cpu() -> dict[str, dict[str, Any]]:
     results = {}
 
     try:
@@ -437,7 +436,7 @@ def sample_cpu() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def sample_memory() -> Dict[str, Dict[str, Any]]:
+def sample_memory() -> dict[str, dict[str, Any]]:
     results = {}
     try:
         meminfo = {}
@@ -538,7 +537,7 @@ def _parse_num(val: Any) -> float:
     return float(m.group(0)) if m else 0.0
 
 
-def sample_gpus() -> Dict[str, Dict[str, Any]]:
+def sample_gpus() -> dict[str, dict[str, Any]]:
     global _NVTOP_AVAILABLE, _NVIDIA_SMI_AVAILABLE
     results = {}
     has_gpus = False
@@ -547,6 +546,7 @@ def sample_gpus() -> Dict[str, Dict[str, Any]]:
         try:
             proc = subprocess.run(
                 ["nvtop", "-s"],
+                check=False,
                 capture_output=True,
                 text=True,
                 timeout=1.5,
@@ -712,7 +712,7 @@ def sample_gpus() -> Dict[str, Dict[str, Any]]:
                 "--query-gpu=index,name,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw,clocks.current.graphics,clocks.current.memory",
                 "--format=csv,noheader,nounits",
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1.5)
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=1.5)
             if proc.returncode == 0 and proc.stdout.strip():
                 _NVIDIA_SMI_AVAILABLE = True
                 for line in proc.stdout.strip().splitlines():
@@ -887,7 +887,7 @@ def sample_gpus() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def sample_hwmon() -> Dict[str, Dict[str, Any]]:
+def sample_hwmon() -> dict[str, dict[str, Any]]:
     results = {}
     hwmon_dirs = sorted(glob.glob("/sys/class/hwmon/hwmon*"))
 
@@ -1017,8 +1017,7 @@ def sample_hwmon() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def sample_network() -> Dict[str, Dict[str, Any]]:
-    global _PREV_NET_BYTES
+def sample_network() -> dict[str, dict[str, Any]]:
     results = {}
     now = time.time()
 
@@ -1085,7 +1084,7 @@ def sample_network() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def sample_battery() -> Dict[str, Dict[str, Any]]:
+def sample_battery() -> dict[str, dict[str, Any]]:
     results = {}
     for pdir in glob.glob("/sys/class/power_supply/*"):
         pname = os.path.basename(pdir)
@@ -1115,7 +1114,7 @@ def sample_battery() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def sample_psi() -> Dict[str, Dict[str, Any]]:
+def sample_psi() -> dict[str, dict[str, Any]]:
     results = {}
     for res in ["cpu", "memory", "io"]:
         path = f"/proc/pressure/{res}"
@@ -1148,7 +1147,7 @@ def sample_psi() -> Dict[str, Dict[str, Any]]:
     return results
 
 
-def collect_all_sensors() -> Dict[str, Dict[str, Any]]:
+def collect_all_sensors() -> dict[str, dict[str, Any]]:
     catalog = {}
     catalog.update(sample_filesystems())
     catalog.update(sample_cpu())
@@ -1364,7 +1363,7 @@ def render_graph_for_instance(
     color: str,
     size: int,
     stroke_width: int = 7,
-) -> Optional[Image.Image]:
+) -> Image.Image | None:
     if not HAS_PIL:
         return None
 
@@ -1383,7 +1382,7 @@ def render_graph_for_instance(
 # Instance Config Storage & IPC
 # ==============================================================================
 
-def load_instances() -> Dict[str, Dict[str, Any]]:
+def load_instances() -> dict[str, dict[str, Any]]:
     if os.path.exists(INSTANCES_FILE):
         try:
             with open(INSTANCES_FILE, "r", encoding="utf-8") as f:
@@ -1397,7 +1396,7 @@ def load_instances() -> Dict[str, Dict[str, Any]]:
     return copy.deepcopy(DEFAULT_INSTANCES)
 
 
-def save_instances(instances: Dict[str, Dict[str, Any]]) -> None:
+def save_instances(instances: dict[str, dict[str, Any]]) -> None:
     tmp_path = INSTANCES_FILE + f".tmp.{os.getpid()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -1408,11 +1407,11 @@ def save_instances(instances: Dict[str, Dict[str, Any]]) -> None:
 
 
 def process_incoming_commands(
-    instances: Dict[str, Dict[str, Any]],
+    instances: dict[str, dict[str, Any]],
     poll_interval: float = 2.0,
     bar_size: int = 34,
     desktop_size: int = 96,
-) -> Tuple[Dict[str, Dict[str, Any]], bool, float, int, int]:
+) -> tuple[dict[str, dict[str, Any]], bool, float, int, int]:
     changed = False
     proc_file = CMD_FILE + f".proc.{os.getpid()}"
     try:
@@ -1493,12 +1492,11 @@ def process_incoming_commands(
 # ==============================================================================
 
 def build_snapshot(
-    instances: Dict[str, Dict[str, Any]],
-    all_sensors: Dict[str, Dict[str, Any]],
+    instances: dict[str, dict[str, Any]],
+    all_sensors: dict[str, dict[str, Any]],
     bar_size: int = 34,
     desktop_size: int = 96,
-) -> Dict[str, Any]:
-    global _INSTANCE_FILES, _INSTANCE_RENDER_KEYS
+) -> dict[str, Any]:
     stamp = int(time.time() * 1000)
     rendered_instances = {}
 
@@ -1506,7 +1504,7 @@ def build_snapshot(
         sensor_id = cfg.get("sensor_id") or "cpu/total_usage"
         sensor = all_sensors.get(sensor_id)
         if not sensor and all_sensors:
-            sensor = all_sensors.get("cpu/total_usage") or list(all_sensors.values())[0]
+            sensor = all_sensors.get("cpu/total_usage") or next(iter(all_sensors.values()))
 
         val = sensor["value"] if sensor else 0.0
         pct = sensor["pct"] if sensor else 0.0
@@ -1542,7 +1540,7 @@ def build_snapshot(
         if cfg.get("show_graph", True) and HAS_PIL:
             quantized_pct = round(pct, 3)
             bar_key = (graph_type, quantized_pct, color, bar_size, stroke_width)
-            desk_stroke = max(stroke_width, int(round(stroke_width * (desktop_size / 34.0))))
+            desk_stroke = max(stroke_width, round(stroke_width * (desktop_size / 34.0)))
             desk_key = (graph_type, quantized_pct, color, desktop_size, desk_stroke)
 
             if _INSTANCE_RENDER_KEYS[inst_id].get("bar") != bar_key or not bar_img_path or not os.path.exists(bar_img_path):
@@ -1608,7 +1606,7 @@ def build_snapshot(
         "stamp": str(stamp),
         "instances": rendered_instances,
         "catalog": catalog_list,
-        "categories": sorted(list(set(s["category"] for s in catalog_list))),
+        "categories": sorted({s["category"] for s in catalog_list}),
     }
 
 
@@ -1668,7 +1666,7 @@ def run_daemon(poll_interval: float, bar_size: int, desktop_size: int) -> None:
             try:
                 sys.stdout.write(snapshot_json + "\n")
                 sys.stdout.flush()
-            except (BrokenPipeError, IOError):
+            except (OSError, BrokenPipeError):
                 break
 
             deadline = time.monotonic() + poll_interval
