@@ -1,5 +1,7 @@
 # TachoPulse (`broli/tachopulse`)
 
+[![CI](https://github.com/broli/tachopulse/actions/workflows/ci.yml/badge.svg)](https://github.com/broli/tachopulse/actions/workflows/ci.yml)
+
 **Modular Hardware & Storage Telemetry Widget for Noctalia v5 (`plugin_api = 32`)**
 
 TachoPulse provides modular, real-time hardware telemetry for the **Noctalia Status Bar** (`[[widget]]`) and **Desktop Wallpaper** (`[[desktop_widget]]`). It pairs a dynamic Linux sensor discovery engine with anti-aliased rendered gauges (Automotive Tachometer, Corner Quarter-Tachometer, Vertical Capsule Bar, and Geometric Radiating Arcs).
