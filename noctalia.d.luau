@@ -62,6 +62,11 @@ declare ui: {
   spacer: (props: { [string]: any }?) -> UiNode,
   separator: (props: { [string]: any }?) -> UiNode,
   input: (props: { [string]: any }) -> UiNode,
+  select: (props: { [string]: any }) -> UiNode,
+  toggle: (props: { [string]: any }) -> UiNode,
+  slider: (props: { [string]: any }) -> UiNode,
+  graph: (props: { [string]: any }) -> UiNode,
+  markdown: (props: { [string]: any }) -> UiNode,
   dragSource: (props: { [string]: any }, children: { UiNode }?) -> UiNode,
   dropZone: (props: { [string]: any }) -> UiNode,
 }

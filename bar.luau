@@ -1,162 +1,158 @@
 --!nonstrict
--- TachoPulse Status Bar Widget (`[[widget]]`).
---
--- Subscribes to `tachopulse.snapshot` published by `service.luau`, rendering
--- all sensors marked `on_bar = true` with adaptive sizing (`< 52px` compact
--- inline mode vs `>= 52px` full 3-line inner tachometer mode) and per-sensor
--- toggles (`show_icon`, `show_label`, `show_value`, `show_graph`).
+-- TachoPulse Bar Widget (`[[widget]]`).
+-- Thin, highly-optimized presentation wrapper rendering the 4 modular face elements
+-- for this named widget instance.
 
-local snapshot = nil
-local isVertical = false
+local PALETTE_HEX = {
+  cyan = "#56d6d6",
+  blue = "#78b4ff",
+  green = "#73e69b",
+  orange = "#ffb96e",
+  purple = "#c391ff",
+  red = "#ff6e7d",
+  yellow = "#fae173",
+  white = "#f0f5ff",
+}
 
-local function renderSensorCell(item, idx, stamp)
-  local parts = {}
-  local isFullRing = item.show_graph and item.graph_type == "ring" and (tonumber(item.bar_w) or 34) >= 52
-
-  if item.show_icon then
-    table.insert(parts, ui.glyph({
-      name = item.icon or "cpu",
-      fontSize = 14,
-      color = "primary",
-    }))
+local function getColorHex(c)
+  if not c or c == "" then
+    return "#56d6d6"
   end
-
-  if item.show_graph and item.bar_img and item.bar_img ~= "" and noctalia.fileExists(item.bar_img) then
-    table.insert(parts, ui.image({
-      key = "tp-bar-" .. tostring(idx) .. "-" .. tostring(stamp),
-      path = item.bar_img,
-      width = tonumber(item.bar_w) or 34,
-      height = tonumber(item.bar_h) or 34,
-    }))
+  if string.sub(c, 1, 1) == "#" then
+    return c
   end
-
-  -- When in full 3-line ring mode (>= 52px), label and value are drawn inside the ring itself.
-  -- In compact ring mode (< 52px), bar/histogram mode, or text-only mode, render clean inline text.
-  if not isFullRing then
-    local textLines = {}
-    if item.show_label then
-      table.insert(textLines, ui.label({
-        text = tostring(item.label or ""),
-        fontSize = 10,
-        fontWeight = "bold",
-        color = "primary",
-        maxLines = 1,
-      }))
-    end
-
-    local showValInline = item.show_value and (not item.show_graph or item.graph_type ~= "ring")
-    if showValInline then
-      table.insert(textLines, ui.label({
-        text = tostring(item.val_text or ""),
-        fontSize = 10,
-        fontWeight = "medium",
-        color = "on_surface",
-        maxLines = 1,
-      }))
-    elseif item.show_label and item.show_value and item.sub_text and item.sub_text ~= "" then
-      table.insert(textLines, ui.label({
-        text = tostring(item.sub_text),
-        fontSize = 9,
-        color = "on_surface_variant",
-        maxLines = 1,
-      }))
-    end
-
-    if #textLines > 0 then
-      table.insert(parts, ui.column({
-        gap = 0,
-        justify = "center",
-      }, textLines))
-    end
-  end
-
-  if #parts == 0 then
-    table.insert(parts, ui.label({
-      text = tostring(item.label or item.val_text or "•"),
-      fontSize = 11,
-      fontWeight = "bold",
-    }))
-  end
-
-  if isVertical then
-    return ui.column({
-      gap = 2,
-      align = "center",
-      paddingV = 2,
-    }, parts)
-  end
-
-  return ui.row({
-    gap = 4,
-    align = "center",
-    paddingH = 3,
-  }, parts)
+  return PALETTE_HEX[c] or "#56d6d6"
 end
+
+local function getInstanceId()
+  local id = noctalia.getConfig("instance_id")
+  if not id or id == "" then
+    return "default"
+  end
+  return id
+end
+
+local currentSnapshot = noctalia.state.get("tachopulse.snapshot")
+local hasRequestedInit = false
 
 local function render()
-  isVertical = barWidget.isVertical()
-  if type(snapshot) ~= "table" or type(snapshot.active) ~= "table" then
-    barWidget.render(ui.row({ gap = 4, align = "center", paddingH = 6 }, {
-      ui.glyph({ name = "gauge", fontSize = 14, color = "primary" }),
-      ui.label({ text = "TachoPulse", fontSize = 11, fontWeight = "bold" }),
-    }))
-    return
+  local container = barWidget.isVertical() and ui.column or ui.row
+  local instanceId = getInstanceId()
+  local inst = nil
+  if currentSnapshot and currentSnapshot.instances then
+    inst = currentSnapshot.instances[instanceId]
   end
 
-  local stamp = tostring(snapshot.stamp or "0")
-  local cells = {}
-  local tooltipRows = {}
-
-  for idx, item in ipairs(snapshot.active) do
-    local sub = (item.sub_text and item.sub_text ~= "") and (" (" .. tostring(item.sub_text) .. ")") or ""
-    table.insert(tooltipRows, {
-      key = tostring(item.name or item.label or item.id),
-      value = tostring(item.val_text or "") .. sub,
+  if not inst then
+    if not hasRequestedInit then
+      hasRequestedInit = true
+      noctalia.state.set("tachopulse.cmd", {
+        action = "ensure_instance",
+        instance_id = instanceId,
+      })
+    end
+    barWidget.render(container({
+      align = "center",
+      gap = 4,
+      padding = 2,
+    }, {
+      ui.glyph({ name = "gauge", size = 15, color = "primary" }),
+      ui.label({ text = instanceId, fontSize = 11, color = "on_surface_variant" }),
+    }))
+    barWidget.setTooltip({
+      { key = "Instance", value = instanceId },
+      { key = "Status", value = "Initializing instance profile..." },
+      { key = "Action", value = "Click to select hardware sensor" },
     })
+    return
+  end
+  hasRequestedInit = false
 
-    if item.on_bar then
-      table.insert(cells, renderSensorCell(item, idx, stamp))
+  local children = {}
+
+  -- 1. Optional Static Icon
+  if inst.show_icon and inst.icon_val and inst.icon_val ~= "" then
+    if inst.icon_type == "emoji" then
+      table.insert(children, ui.label({
+        text = inst.icon_val,
+        fontSize = 13,
+      }))
+    else
+      table.insert(children, ui.glyph({
+        name = inst.icon_val,
+        size = 15,
+        color = getColorHex(inst.color),
+      }))
     end
   end
 
-  if #tooltipRows > 0 then
-    barWidget.setTooltip(tooltipRows)
-  end
-
-  if #cells == 0 then
-    barWidget.render(ui.row({ gap = 4, align = "center", paddingH = 6 }, {
-      ui.glyph({ name = "gauge", fontSize = 14, color = "primary" }),
+  -- 2. Optional Dynamic Graphic
+  if inst.show_graph and inst.bar_img and inst.bar_img ~= "" then
+    local gaugeSize = tonumber(inst.bar_size) or 34
+    table.insert(children, ui.image({
+      path = inst.bar_img,
+      width = gaugeSize,
+      height = gaugeSize,
+      radius = 4,
     }))
-    return
   end
 
-  if isVertical then
-    barWidget.render(ui.column({
-      gap = 4,
-      align = "center",
-      paddingV = 4,
-    }, cells))
-  else
-    barWidget.render(ui.row({
-      gap = 6,
-      align = "center",
-      paddingH = 4,
-    }, cells))
+  -- 3. Optional Numerical Value
+  if inst.show_value and inst.val_text and inst.val_text ~= "" then
+    table.insert(children, ui.label({
+      text = inst.val_text,
+      fontSize = 12,
+      fontWeight = "bold",
+      color = "on_surface",
+    }))
   end
+
+  -- 4. Optional Custom Label
+  if inst.show_label and inst.label and inst.label ~= "" then
+    table.insert(children, ui.label({
+      text = inst.label,
+      fontSize = 11,
+      color = "on_surface_variant",
+    }))
+  end
+
+  if #children == 0 then
+    table.insert(children, ui.label({
+      text = "•",
+      fontSize = 12,
+      color = "outline",
+    }))
+  end
+
+  barWidget.render(container({
+    align = "center",
+    gap = 4,
+    padding = 2,
+  }, children))
+
+  local displayName = (inst.name and inst.name ~= "" and inst.name ~= "default") and inst.name or instanceId
+  barWidget.setTooltip({
+    { key = "Instance", value = displayName },
+    { key = "Sensor", value = inst.sensor_name or inst.sensor_id },
+    { key = "Live Reading", value = inst.val_text or tostring(inst.value) },
+    { key = "Style", value = inst.graph_type or "quarter" },
+  })
 end
 
-noctalia.state.watch("tachopulse.snapshot", function(val)
-  snapshot = val
-  render()
+noctalia.state.watch("tachopulse.snapshot", function(snap)
+  if type(snap) == "table" and snap.instances then
+    currentSnapshot = snap
+    render()
+  end
 end)
 
-function update()
+function onConfigChanged()
   render()
 end
 
 function onClick()
-  noctalia.togglePanel("broli/tachopulse:panel")
+  local instanceId = getInstanceId()
+  noctalia.togglePanel("broli/tachopulse:panel", instanceId)
 end
 
-snapshot = noctalia.state.get("tachopulse.snapshot")
 render()

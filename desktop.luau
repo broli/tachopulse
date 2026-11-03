@@ -1,159 +1,137 @@
 --!nonstrict
--- TachoPulse Desktop Wallpaper Widget (`[[desktop_widget]]`).
---
--- Renders all active sensors marked `on_desktop = true` in a multi-column
--- translucent card grid on the desktop background layer-shell surface.
+-- TachoPulse Desktop Widget (`[[desktop_widget]]`).
+-- Renders the same modular face elements as a card pinned to the desktop wallpaper.
 
-local snapshot = nil
+local PALETTE_HEX = {
+  cyan = "#56d6d6",
+  blue = "#78b4ff",
+  green = "#73e69b",
+  orange = "#ffb96e",
+  purple = "#c391ff",
+  red = "#ff6e7d",
+  yellow = "#fae173",
+  white = "#f0f5ff",
+}
 
-local function renderDesktopCard(item, idx, stamp)
-  local children = {}
-  local isRingGraph = item.show_graph and item.graph_type == "ring"
-
-  if item.show_icon or (item.show_label and not isRingGraph) then
-    local headerItems = {}
-    if item.show_icon then
-      table.insert(headerItems, ui.glyph({
-        name = item.icon or "cpu",
-        fontSize = 14,
-        color = "primary",
-      }))
-    end
-    if item.show_label and not isRingGraph then
-      table.insert(headerItems, ui.label({
-        text = tostring(item.label or ""),
-        fontSize = 12,
-        fontWeight = "bold",
-        color = "primary",
-      }))
-    end
-    if #headerItems > 0 then
-      table.insert(children, ui.row({
-        gap = 5,
-        align = "center",
-        justify = "center",
-      }, headerItems))
-    end
+local function getColorHex(c)
+  if not c or c == "" then
+    return "#56d6d6"
   end
-
-  if item.show_graph and item.desk_img and item.desk_img ~= "" and noctalia.fileExists(item.desk_img) then
-    table.insert(children, ui.image({
-      key = "tp-desk-" .. tostring(idx) .. "-" .. tostring(stamp),
-      path = item.desk_img,
-      width = tonumber(item.desk_w) or 96,
-      height = tonumber(item.desk_h) or 96,
-    }))
-  else
-    if item.show_value then
-      table.insert(children, ui.label({
-        text = tostring(item.val_text or ""),
-        fontSize = 22,
-        fontWeight = "bold",
-        color = "on_surface",
-      }))
-    end
-    if item.show_label and isRingGraph then
-      table.insert(children, ui.label({
-        text = tostring(item.label or ""),
-        fontSize = 12,
-        fontWeight = "bold",
-        color = "primary",
-      }))
-    end
+  if string.sub(c, 1, 1) == "#" then
+    return c
   end
-
-  if not isRingGraph and item.show_value and item.sub_text and item.sub_text ~= "" then
-    table.insert(children, ui.label({
-      text = tostring(item.sub_text),
-      fontSize = 10,
-      color = "on_surface_variant",
-    }))
-  end
-
-  return ui.column({
-    gap = 4,
-    padding = 8,
-    radius = 14,
-    fill = "surface_variant/0.55",
-    align = "center",
-    justify = "center",
-  }, children)
+  return PALETTE_HEX[c] or "#56d6d6"
 end
 
+local function getInstanceId()
+  local id = noctalia.getConfig("instance_id")
+  if not id or id == "" then
+    return "default"
+  end
+  return id
+end
+
+local currentSnapshot = noctalia.state.get("tachopulse.snapshot")
+local hasRequestedInit = false
+
 local function render()
-  if type(snapshot) ~= "table" or type(snapshot.active) ~= "table" then
+  local instanceId = getInstanceId()
+  local inst = nil
+  if currentSnapshot and currentSnapshot.instances then
+    inst = currentSnapshot.instances[instanceId]
+  end
+
+  if not inst then
+    if not hasRequestedInit then
+      hasRequestedInit = true
+      noctalia.state.set("tachopulse.cmd", {
+        action = "ensure_instance",
+        instance_id = instanceId,
+      })
+    end
     desktopWidget.render(ui.column({
-      gap = 6,
       padding = 12,
-      radius = 14,
-      fill = "surface_variant/0.55",
-      align = "center",
-    }, {
-      ui.glyph({ name = "gauge", fontSize = 24, color = "primary" }),
-      ui.label({ text = "TachoPulse", fontSize = 14, fontWeight = "bold" }),
-    }))
-    return
-  end
-
-  local cols = tonumber(noctalia.getConfig("desktop_columns")) or 3
-  if cols < 1 then
-    cols = 1
-  end
-
-  local stamp = tostring(snapshot.stamp or "0")
-  local cards = {}
-  for idx, item in ipairs(snapshot.active) do
-    if item.on_desktop then
-      table.insert(cards, renderDesktopCard(item, idx, stamp))
-    end
-  end
-
-  if #cards == 0 then
-    desktopWidget.render(ui.column({
-      gap = 4,
-      padding = 10,
       radius = 12,
-      fill = "surface_variant/0.4",
+      fill = "surface_variant/0.65",
       align = "center",
     }, {
-      ui.label({ text = "TachoPulse (No desktop sensors enabled)", fontSize = 11, color = "outline" }),
+      ui.label({ text = "TachoPulse: " .. instanceId, fontSize = 12, color = "on_surface_variant" }),
+      ui.label({ text = "Initializing profile...", fontSize = 10, color = "outline" }),
     }))
     return
   end
+  hasRequestedInit = false
 
-  local rows = {}
-  local currentRow = {}
-  for i, card in ipairs(cards) do
-    table.insert(currentRow, card)
-    if #currentRow >= cols or i == #cards then
-      table.insert(rows, ui.row({
-        gap = 8,
-        align = "center",
-        justify = "center",
-      }, currentRow))
-      currentRow = {}
+  local gaugeSize = tonumber(inst.desktop_size) or 96
+  local colChildren = {}
+
+  -- Header: Icon + Custom Label
+  local headerChildren = {}
+  if inst.show_icon and inst.icon_val and inst.icon_val ~= "" then
+    if inst.icon_type == "emoji" then
+      table.insert(headerChildren, ui.label({ text = inst.icon_val, fontSize = 14 }))
+    else
+      table.insert(headerChildren, ui.glyph({ name = inst.icon_val, size = 16, color = getColorHex(inst.color) }))
     end
+  end
+  if inst.show_label and inst.label and inst.label ~= "" then
+    table.insert(headerChildren, ui.label({ text = inst.label, fontSize = 12, fontWeight = "bold", color = "on_surface" }))
+  end
+  if #headerChildren > 0 then
+    table.insert(colChildren, ui.row({ align = "center", gap = 6 }, headerChildren))
+  end
+
+  -- Dynamic Graphic
+  if inst.show_graph and inst.desk_img and inst.desk_img ~= "" then
+    table.insert(colChildren, ui.image({
+      path = inst.desk_img,
+      width = gaugeSize,
+      height = gaugeSize,
+      radius = 6,
+    }))
+  end
+
+  -- Numerical Value
+  if inst.show_value and inst.val_text and inst.val_text ~= "" then
+    table.insert(colChildren, ui.label({
+      text = inst.val_text,
+      fontSize = 14,
+      fontWeight = "bold",
+      color = "on_surface",
+    }))
+  end
+
+  if #colChildren == 0 then
+    table.insert(colChildren, ui.label({
+      text = "•",
+      fontSize = 14,
+      color = "outline",
+    }))
   end
 
   desktopWidget.render(ui.column({
-    gap = 8,
-    padding = 8,
+    padding = 10,
+    radius = 12,
+    fill = "surface_variant/0.75",
     align = "center",
-  }, rows))
+    gap = 6,
+  }, colChildren))
 end
 
-noctalia.state.watch("tachopulse.snapshot", function(val)
-  snapshot = val
-  render()
+noctalia.state.watch("tachopulse.snapshot", function(snap)
+  if type(snap) == "table" and snap.instances then
+    currentSnapshot = snap
+    render()
+  end
 end)
 
 function onConfigChanged()
   render()
 end
 
-function update()
-  render()
+function onClick()
+  local instanceId = getInstanceId()
+  noctalia.togglePanel("broli/tachopulse:panel", instanceId)
 end
 
-snapshot = noctalia.state.get("tachopulse.snapshot")
 render()
