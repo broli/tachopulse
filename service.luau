@@ -1,178 +1,129 @@
 --!nonstrict
--- TachoPulse headless background service (`[[service]]`).
---
--- Manages the active sensor configuration in `noctalia.pluginDataDir()/sensors.json`,
--- invokes `scripts/sensor_daemon.py` at the configured polling interval, and
--- broadcasts live snapshots + rendered graph paths to `bar.luau`, `desktop.luau`,
--- and `panel.luau` via `noctalia.state`.
+-- TachoPulse Service Daemon (`[[service]]`).
+-- Manages the telemetry sensor daemon, streams updates, and publishes
+-- real-time state to noctalia.state for all widget instances.
 
-local COLORS = { "blue", "cyan", "green", "orange", "purple", "red", "yellow" }
+local RUNTIME_BASE = (noctalia.getenv("XDG_RUNTIME_DIR") or "/dev/shm") .. "/tachopulse"
+local SNAPSHOT_PATH = RUNTIME_BASE .. "/snapshot.json"
+local CMD_PATH = RUNTIME_BASE .. "/cmd.json"
 
-local runtimeDir = (noctalia.getenv("XDG_RUNTIME_DIR") or "/dev/shm") .. "/tachopulse"
-local snapshotPath = runtimeDir .. "/snapshot.json"
+local defaultPollMs = 2000
+local isDaemonStreaming = false
+local isPollingFallback = false
+local lastStreamTick = 0
 
-local function getSensorsPath()
-  local dataDir = noctalia.pluginDataDir()
-  if dataDir and dataDir ~= "" then
-    return dataDir .. "/sensors.json"
+local function getPollInterval()
+  local poll = tonumber(noctalia.getConfig("poll_interval_ms"))
+  if not poll or poll < 500 then
+    return defaultPollMs
   end
-  return runtimeDir .. "/sensors.json"
+  return poll
 end
 
-local activeSensors = {}
-local isPolling = false
-local lastPollStartMs = 0
+local function getGaugeSizes()
+  local barSize = tonumber(noctalia.getConfig("bar_gauge_size")) or 34
+  local deskSize = tonumber(noctalia.getConfig("desktop_gauge_size")) or 96
+  return barSize, deskSize
+end
 
-local function loadSavedSensors()
-  local path = getSensorsPath()
-  if noctalia.fileExists(path) then
-    local raw = noctalia.readFile(path)
+local function applySnapshot(snap)
+  if type(snap) == "table" and snap.instances then
+    noctalia.state.set("tachopulse.snapshot", snap)
+  end
+end
+
+local function loadSnapshotFromDisk()
+  if noctalia.fileExists(SNAPSHOT_PATH) then
+    local raw = noctalia.readFile(SNAPSHOT_PATH)
     if raw and raw ~= "" then
-      local decoded = noctalia.json.decode(raw)
-      if type(decoded) == "table" and #decoded > 0 then
-        activeSensors = decoded
-        return
-      end
+      local snap = noctalia.json.decode(raw)
+      applySnapshot(snap)
     end
   end
 end
 
-local function saveSensors()
-  local path = getSensorsPath()
-  local encoded = noctalia.json.encode(activeSensors)
-  if encoded then
-    noctalia.writeFile(path, encoded)
-  end
-end
-
-local function applyInterval()
-  local interval = tonumber(noctalia.getConfig("poll_interval_ms")) or 2000
-  if interval < 500 then
-    interval = 500
-  end
-  noctalia.setUpdateInterval(interval)
-end
-
-local function pollHardware()
-  local now = noctalia.nowMs()
-  if isPolling and (now - lastPollStartMs) < 5000 then
+local function triggerFallbackPoll()
+  if isPollingFallback then
     return
   end
-  isPolling = true
-  lastPollStartMs = now
+  isPollingFallback = true
 
-  local pluginDir = noctalia.pluginDir()
-  local theme = noctalia.isDarkMode() and "dark" or "light"
-  local barSize = tostring(tonumber(noctalia.getConfig("bar_gauge_size")) or 34)
-  local deskSize = tostring(tonumber(noctalia.getConfig("desktop_gauge_size")) or 96)
-  local respectSleep = (noctalia.getConfig("respect_gpu_sleep") == true) and "true" or "false"
-  local sensorsPath = getSensorsPath()
-
-  local cmd = string.format(
-    'python3 "%s/scripts/sensor_daemon.py" "%s" "%s" "%s" "%s" "%s"',
-    pluginDir,
-    theme,
-    barSize,
-    deskSize,
-    respectSleep,
-    sensorsPath
-  )
+  local scriptPath = noctalia.pluginDir() .. "/scripts/sensor_daemon.py"
+  local barSize, deskSize = getGaugeSizes()
+  local cmd = string.format("python3 %s --bar-size %d --desktop-size %d", scriptPath, barSize, deskSize)
 
   noctalia.runAsync(cmd, function(res)
-    isPolling = false
-    if res and res.exitCode == 0 and noctalia.fileExists(snapshotPath) then
-      local raw = noctalia.readFile(snapshotPath)
-      if raw and raw ~= "" then
-        local snap = noctalia.json.decode(raw)
-        if type(snap) == "table" then
-          if #activeSensors == 0 then
-            loadSavedSensors()
-          end
-          noctalia.state.set("tachopulse.snapshot", snap)
-        end
-      end
+    isPollingFallback = false
+    if res.exitCode == 0 then
+      loadSnapshotFromDisk()
     end
-  end, 4500)
+  end, 3000)
 end
 
-noctalia.state.watch("tachopulse.cmd", function(cmd)
-  if type(cmd) ~= "table" then
-    return
-  end
-  loadSavedSensors()
-  local action = cmd.action
-  local idx = tonumber(cmd.index)
+local function startDaemonStream()
+  local scriptPath = noctalia.pluginDir() .. "/scripts/sensor_daemon.py"
+  local barSize, deskSize = getGaugeSizes()
+  local pollSec = getPollInterval() / 1000.0
+  local cmd = string.format("python3 %s --daemon --poll %.2f --bar-size %d --desktop-size %d", scriptPath, pollSec, barSize, deskSize)
 
-  if action == "toggle_field" and idx and activeSensors[idx] and type(cmd.field) == "string" then
-    local field = cmd.field
-    activeSensors[idx][field] = not (activeSensors[idx][field] == true)
-    saveSensors()
-    pollHardware()
-  elseif action == "set_graph_type" and idx and activeSensors[idx] and type(cmd.graph_type) == "string" then
-    activeSensors[idx].graph_type = cmd.graph_type
-    saveSensors()
-    pollHardware()
-  elseif action == "cycle_color" and idx and activeSensors[idx] then
-    local cur = activeSensors[idx].color or "blue"
-    local nextCol = "blue"
-    for i, c in ipairs(COLORS) do
-      if c == cur then
-        nextCol = COLORS[(i % #COLORS) + 1]
-        break
+  lastStreamTick = os.time()
+  isDaemonStreaming = noctalia.runStream(cmd, function(line)
+    if line and line ~= "" then
+      lastStreamTick = os.time()
+      local ok, snap = pcall(noctalia.json.decode, line)
+      if ok and type(snap) == "table" and snap.instances then
+        applySnapshot(snap)
       end
     end
-    activeSensors[idx].color = nextCol
-    saveSensors()
-    pollHardware()
-  elseif action == "move" and idx and activeSensors[idx] then
-    local delta = tonumber(cmd.delta) or 0
-    local target = idx + delta
-    if target >= 1 and target <= #activeSensors then
-      local tmp = activeSensors[idx]
-      activeSensors[idx] = activeSensors[target]
-      activeSensors[target] = tmp
-      saveSensors()
-      pollHardware()
+  end)
+
+  if not isDaemonStreaming then
+    triggerFallbackPoll()
+  end
+end
+
+-- Watch for commands from the Configuration Studio or widgets
+noctalia.state.watch("tachopulse.cmd", function(val)
+  if type(val) == "table" and val.action then
+    local payload = noctalia.json.encode(val)
+    if payload then
+      noctalia.writeFile(CMD_PATH, payload)
+      if not isDaemonStreaming then
+        triggerFallbackPoll()
+      end
     end
-  elseif action == "remove" and idx and activeSensors[idx] then
-    table.remove(activeSensors, idx)
-    saveSensors()
-    pollHardware()
-  elseif action == "add" and type(cmd.sensor) == "table" then
-    local s = cmd.sensor
-    table.insert(activeSensors, {
-      id = s.id,
-      label = s.short_label or "SENS",
-      graph_type = "ring",
-      color = s.default_color or "blue",
-      show_icon = false,
-      show_label = true,
-      show_value = true,
-      show_graph = true,
-      on_bar = true,
-      on_desktop = true,
-    })
-    saveSensors()
-    pollHardware()
-  elseif action == "reset_defaults" then
-    activeSensors = {}
-    local path = getSensorsPath()
-    if noctalia.fileExists(path) then
-      noctalia.removeFile(path)
-    end
-    pollHardware()
   end
 end)
 
-function onConfigChanged()
-  applyInterval()
-  pollHardware()
-end
-
 function update()
-  pollHardware()
+  local pollSec = getPollInterval() / 1000.0
+  local maxGapSec = math.max(6, math.floor(pollSec * 3) + 2)
+  if not isDaemonStreaming or (os.time() - lastStreamTick > maxGapSec) then
+    isDaemonStreaming = false
+    startDaemonStream()
+  end
 end
 
-loadSavedSensors()
-applyInterval()
-pollHardware()
+local function sendDaemonConfig()
+  local barSize, deskSize = getGaugeSizes()
+  local pollSec = getPollInterval() / 1000.0
+  noctalia.state.set("tachopulse.cmd", {
+    action = "configure",
+    poll_interval = pollSec,
+    bar_size = barSize,
+    desktop_size = deskSize,
+  })
+end
+
+function onConfigChanged()
+  noctalia.setUpdateInterval(getPollInterval())
+  if isDaemonStreaming then
+    sendDaemonConfig()
+  else
+    startDaemonStream()
+  end
+end
+
+noctalia.setUpdateInterval(getPollInterval())
+loadSnapshotFromDisk()
+startDaemonStream()
